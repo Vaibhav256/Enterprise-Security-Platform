@@ -1,7 +1,7 @@
 # Intelligence Layer Dependencies
 
 # Core RAG Components
-sentence-transformers==2.2.2      # Embedding model for semantic search
+sentence-transformers==5.2.0      # Embedding model for semantic search
 chromadb==0.4.22                  # Vector database for retrieval
 networkx==3.2.1                   # Graph database for attack paths
 

@@ -15,7 +15,7 @@ en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_
 
 # Data Handling
 numpy==1.26.3                     # Numerical operations
-pandas==2.2.0                     # Data manipulation
+pandas==2.3.3                     # Data manipulation
 
 # Visualization (for attack graph rendering)
 matplotlib==3.8.2                 # Static graph visualization

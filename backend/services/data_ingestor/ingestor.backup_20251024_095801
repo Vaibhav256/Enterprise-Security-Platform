@@ -1,0 +1,455 @@
+"""
+Data Ingestor
+
+This module provides the data ingestion layer for storing scan results in the database.
+It handles CRUD operations and data validation.
+
+Author: NTRO Security Team
+Date: 2025-10-22
+"""
+
+import logging
+from typing import Dict, Any, List, Optional
+from datetime import datetime
+from sqlalchemy import create_engine, and_, or_
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import SQLAlchemyError
+
+from .models import Base, Scan, RawScanResult, ScanSummary, ScanStatus
+
+logger = logging.getLogger(__name__)
+
+
+class DataIngestor:
+    """
+    Data ingestor for managing scan data in the database
+    
+    Provides methods for creating, reading, updating, and deleting scan records.
+    """
+    
+    def __init__(self, database_url: str):
+        """
+        Initialize data ingestor
+        
+        Args:
+            database_url: SQLAlchemy database URL
+                e.g., "postgresql://user:password@localhost:5432/dbname"
+        """
+        self.engine = create_engine(database_url, pool_pre_ping=True)
+        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        
+        # Create tables if they don't exist
+        Base.metadata.create_all(self.engine)
+        
+        logger.info("Data ingestor initialized")
+    
+    def get_session(self) -> Session:
+        """Get a new database session"""
+        return self.SessionLocal()
+    
+    # ==================== Scan Operations ====================
+    
+    def create_scan(
+        self,
+        scan_id: str,
+        target: str,
+        tool_name: str,
+        scan_type: str,
+        options: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+        priority: str = "normal",
+        job_id: Optional[str] = None
+    ) -> Scan:
+        """
+        Create a new scan record
+        
+        Args:
+            scan_id: Unique scan identifier
+            target: Scan target
+            tool_name: Tool to use
+            scan_type: Type of scan
+            options: Scan options
+            tags: Tags for categorization
+            priority: Scan priority
+            job_id: Redis job ID
+            
+        Returns:
+            Scan object
+        """
+        session = self.get_session()
+        
+        try:
+            scan = Scan(
+                scan_id=scan_id,
+                target=target,
+                tool_name=tool_name,
+                scan_type=scan_type,
+                status=ScanStatus.PENDING,
+                options=options,
+                tags=tags,
+                priority=priority,
+                job_id=job_id
+            )
+            
+            session.add(scan)
+            session.commit()
+            session.refresh(scan)
+            
+            logger.info(f"Created scan record: {scan_id}")
+            return scan
+            
+        except SQLAlchemyError as e:
+            session.rollback()
+            logger.error(f"Failed to create scan: {str(e)}")
+            raise
+        finally:
+            session.close()
+    
+    def get_scan(self, scan_id: str) -> Optional[Scan]:
+        """
+        Get a scan by ID
+        
+        Args:
+            scan_id: Scan ID
+            
+        Returns:
+            Scan object or None if not found
+        """
+        session = self.get_session()
+        
+        try:
+            scan = session.query(Scan).filter(Scan.scan_id == scan_id).first()
+            return scan
+        finally:
+            session.close()
+    
+    def update_scan_status(
+        self,
+        scan_id: str,
+        status: ScanStatus,
+        progress: Optional[int] = None,
+        error_message: Optional[str] = None
+    ) -> bool:
+        """
+        Update scan status
+        
+        Args:
+            scan_id: Scan ID
+            status: New status
+            progress: Progress percentage
+            error_message: Error message if failed
+            
+        Returns:
+            True if updated successfully
+        """
+        session = self.get_session()
+        
+        try:
+            scan = session.query(Scan).filter(Scan.scan_id == scan_id).first()
+            
+            if not scan:
+                logger.warning(f"Scan not found: {scan_id}")
+                return False
+            
+            scan.status = status
+            
+            if progress is not None:
+                scan.progress = progress
+            
+            if error_message:
+                scan.error_message = error_message
+            
+            # Update timestamps based on status
+            if status == ScanStatus.RUNNING and not scan.started_at:
+                scan.started_at = datetime.utcnow()
+            elif status in [ScanStatus.COMPLETED, ScanStatus.FAILED, ScanStatus.CANCELLED]:
+                scan.completed_at = datetime.utcnow()
+                
+                # Calculate execution time
+                if scan.started_at:
+                    scan.execution_time = (scan.completed_at - scan.started_at).total_seconds()
+            
+            session.commit()
+            logger.info(f"Updated scan {scan_id} status to {status.value}")
+            return True
+            
+        except SQLAlchemyError as e:
+            session.rollback()
+            logger.error(f"Failed to update scan status: {str(e)}")
+            return False
+        finally:
+            session.close()
+    
+    def list_scans(
+        self,
+        status: Optional[ScanStatus] = None,
+        tool: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+        sort_by: str = "created_at",
+        sort_order: str = "desc"
+    ) -> tuple[List[Scan], int]:
+        """
+        List scans with filtering and pagination
+        
+        Args:
+            status: Filter by status
+            tool: Filter by tool
+            limit: Maximum number of results
+            offset: Offset for pagination
+            sort_by: Field to sort by
+            sort_order: Sort order (asc or desc)
+            
+        Returns:
+            Tuple of (scan list, total count)
+        """
+        session = self.get_session()
+        
+        try:
+            query = session.query(Scan)
+            
+            # Apply filters
+            if status:
+                query = query.filter(Scan.status == status)
+            
+            if tool:
+                query = query.filter(Scan.tool_name == tool)
+            
+            # Get total count
+            total = query.count()
+            
+            # Apply sorting
+            sort_column = getattr(Scan, sort_by, Scan.created_at)
+            if sort_order == "desc":
+                query = query.order_by(sort_column.desc())
+            else:
+                query = query.order_by(sort_column.asc())
+            
+            # Apply pagination
+            scans = query.limit(limit).offset(offset).all()
+            
+            return scans, total
+            
+        finally:
+            session.close()
+    
+    def delete_scan(self, scan_id: str) -> bool:
+        """
+        Delete a scan and all associated data
+        
+        Args:
+            scan_id: Scan ID
+            
+        Returns:
+            True if deleted successfully
+        """
+        session = self.get_session()
+        
+        try:
+            scan = session.query(Scan).filter(Scan.scan_id == scan_id).first()
+            
+            if not scan:
+                logger.warning(f"Scan not found: {scan_id}")
+                return False
+            
+            session.delete(scan)
+            session.commit()
+            
+            logger.info(f"Deleted scan: {scan_id}")
+            return True
+            
+        except SQLAlchemyError as e:
+            session.rollback()
+            logger.error(f"Failed to delete scan: {str(e)}")
+            return False
+        finally:
+            session.close()
+    
+    # ==================== Raw Result Operations ====================
+    
+    def store_raw_result(
+        self,
+        scan_id: str,
+        tool_name: str,
+        raw_output: str,
+        output_format: str = "text",
+        parsed_output: Optional[Dict[str, Any]] = None
+    ) -> RawScanResult:
+        """
+        Store raw scan result
+        
+        Args:
+            scan_id: Scan ID
+            tool_name: Tool name
+            raw_output: Raw output string
+            output_format: Output format (xml, json, text)
+            parsed_output: Parsed output dictionary
+            
+        Returns:
+            RawScanResult object
+        """
+        session = self.get_session()
+        
+        try:
+            result = RawScanResult(
+                scan_id=scan_id,
+                tool_name=tool_name,
+                raw_output=raw_output,
+                output_format=output_format,
+                parsed_output=parsed_output,
+                file_size=len(raw_output.encode('utf-8'))
+            )
+            
+            session.add(result)
+            session.commit()
+            session.refresh(result)
+            
+            logger.info(f"Stored raw result for scan {scan_id}")
+            return result
+            
+        except SQLAlchemyError as e:
+            session.rollback()
+            logger.error(f"Failed to store raw result: {str(e)}")
+            raise
+        finally:
+            session.close()
+    
+    def get_raw_results(self, scan_id: str) -> List[RawScanResult]:
+        """
+        Get raw results for a scan
+        
+        Args:
+            scan_id: Scan ID
+            
+        Returns:
+            List of RawScanResult objects
+        """
+        session = self.get_session()
+        
+        try:
+            results = session.query(RawScanResult).filter(
+                RawScanResult.scan_id == scan_id
+            ).all()
+            
+            return results
+        finally:
+            session.close()
+    
+    # ==================== Summary Operations ====================
+    
+    def create_scan_summary(
+        self,
+        scan_id: str,
+        summary_data: Dict[str, Any]
+    ) -> ScanSummary:
+        """
+        Create scan summary
+        
+        Args:
+            scan_id: Scan ID
+            summary_data: Summary statistics
+            
+        Returns:
+            ScanSummary object
+        """
+        session = self.get_session()
+        
+        try:
+            summary = ScanSummary(
+                scan_id=scan_id,
+                hosts_scanned=summary_data.get('hosts_scanned', 0),
+                hosts_up=summary_data.get('hosts_up', 0),
+                total_ports=summary_data.get('total_ports', 0),
+                open_ports=summary_data.get('open_ports', 0),
+                vulnerabilities_found=summary_data.get('vulnerabilities_found', 0),
+                critical_count=summary_data.get('critical_count', 0),
+                high_count=summary_data.get('high_count', 0),
+                medium_count=summary_data.get('medium_count', 0),
+                low_count=summary_data.get('low_count', 0),
+                info_count=summary_data.get('info_count', 0),
+                summary_data=summary_data
+            )
+            
+            session.add(summary)
+            session.commit()
+            session.refresh(summary)
+            
+            logger.info(f"Created summary for scan {scan_id}")
+            return summary
+            
+        except SQLAlchemyError as e:
+            session.rollback()
+            logger.error(f"Failed to create summary: {str(e)}")
+            raise
+        finally:
+            session.close()
+    
+    def get_scan_summary(self, scan_id: str) -> Optional[ScanSummary]:
+        """
+        Get scan summary
+        
+        Args:
+            scan_id: Scan ID
+            
+        Returns:
+            ScanSummary object or None
+        """
+        session = self.get_session()
+        
+        try:
+            summary = session.query(ScanSummary).filter(
+                ScanSummary.scan_id == scan_id
+            ).first()
+            
+            return summary
+        finally:
+            session.close()
+
+
+def create_ingestor_from_config(config: Dict[str, Any]) -> DataIngestor:
+    """
+    Create data ingestor from configuration
+    
+    Args:
+        config: Configuration dictionary
+        
+    Returns:
+        DataIngestor instance
+    """
+    db_config = config.get('database', {})
+    
+    # Build database URL
+    database_url = db_config.get('url')
+    
+    if not database_url:
+        # Build from components
+        db_type = db_config.get('type', 'postgresql')
+        username = db_config.get('username', 'postgres')
+        password = db_config.get('password', '')
+        host = db_config.get('host', 'localhost')
+        port = db_config.get('port', 5432)
+        database = db_config.get('database', 'vulnerability_scanner')
+        
+        database_url = f"{db_type}://{username}:{password}@{host}:{port}/{database}"
+    
+    return DataIngestor(database_url)
+
+
+if __name__ == "__main__":
+    # Example usage
+    logging.basicConfig(level=logging.INFO)
+    
+    print("=== Data Ingestor Test ===\n")
+    
+    # Example database URL (update with your actual credentials)
+    database_url = "postgresql://postgres:password@localhost:5432/vulnerability_scanner"
+    
+    print(f"Database URL: {database_url}")
+    print("\nTo use the data ingestor:")
+    print("  ingestor = DataIngestor(database_url)")
+    print("  scan = ingestor.create_scan(")
+    print("      scan_id=str(uuid.uuid4()),")
+    print("      target='192.168.1.1',")
+    print("      tool_name='nmap',")
+    print("      scan_type='basic'")
+    print("  )")

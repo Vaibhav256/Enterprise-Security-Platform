@@ -1,0 +1,840 @@
+openapi: 3.0.3
+info:
+  title: Centralized Vulnerability Detection API
+  description: |
+    RESTful API for the Centralized Vulnerability Detection and Intelligent Query Interface platform.
+    This API provides endpoints for managing vulnerability scans, retrieving scan results, and querying scan status.
+    
+    ## Features
+    - Initiate scans with multiple tools (Nmap, OpenVAS, Nessus, Nikto, Nuclei)
+    - Track scan progress and status
+    - Retrieve raw and parsed scan results
+    - Support for multiple scan types and configurations
+    
+  version: 1.0.0
+  contact:
+    name: NTRO Security Team
+    email: security@ntro.gov
+  license:
+    name: Proprietary
+    
+servers:
+  - url: http://localhost:5000/api
+    description: Development server
+  - url: https://api.vulnerability-scanner.ntro.gov/api
+    description: Production server
+
+tags:
+  - name: scans
+    description: Scan management operations
+  - name: health
+    description: System health and status
+
+paths:
+  /scans:
+    post:
+      tags:
+        - scans
+      summary: Initiate a new vulnerability scan
+      description: |
+        Creates a new scan job and adds it to the processing queue.
+        The scan will be executed asynchronously by the orchestrator.
+      operationId: createScan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScanRequest'
+            examples:
+              nmapScan:
+                summary: Basic Nmap scan
+                value:
+                  target: "192.168.1.1"
+                  tool: "nmap"
+                  scan_type: "basic"
+                  options:
+                    ports: "1-1000"
+                    timing: "T4"
+              openvasScan:
+                summary: OpenVAS vulnerability scan
+                value:
+                  target: "192.168.1.0/24"
+                  tool: "openvas"
+                  scan_type: "full"
+                  options:
+                    config_id: "daba56c8-73ec-11df-a475-002264764cea"
+      responses:
+        '201':
+          description: Scan created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScanResponse'
+              example:
+                scan_id: "550e8400-e29b-41d4-a716-446655440000"
+                status: "pending"
+                target: "192.168.1.1"
+                tool: "nmap"
+                scan_type: "basic"
+                created_at: "2025-10-22T10:30:00Z"
+                message: "Scan queued successfully"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    
+    get:
+      tags:
+        - scans
+      summary: List all scans
+      description: Retrieve a paginated list of all scans with optional filtering
+      operationId: listScans
+      parameters:
+        - name: status
+          in: query
+          description: Filter by scan status
+          schema:
+            type: string
+            enum: [pending, running, completed, failed, cancelled]
+        - name: tool
+          in: query
+          description: Filter by tool name
+          schema:
+            type: string
+            enum: [nmap, openvas, nessus, nikto, nuclei]
+        - name: page
+          in: query
+          description: Page number for pagination
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          description: Number of items per page
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: sort
+          in: query
+          description: Sort field and order
+          schema:
+            type: string
+            enum: [created_at_asc, created_at_desc, completed_at_asc, completed_at_desc]
+            default: created_at_desc
+      responses:
+        '200':
+          description: List of scans retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScanList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /scans/{scan_id}:
+    get:
+      tags:
+        - scans
+      summary: Get scan details
+      description: Retrieve detailed information about a specific scan
+      operationId: getScan
+      parameters:
+        - $ref: '#/components/parameters/ScanId'
+      responses:
+        '200':
+          description: Scan details retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScanDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    
+    delete:
+      tags:
+        - scans
+      summary: Cancel a scan
+      description: Cancel a pending or running scan
+      operationId: cancelScan
+      parameters:
+        - $ref: '#/components/parameters/ScanId'
+      responses:
+        '200':
+          description: Scan cancelled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scan_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [cancelled]
+                  message:
+                    type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Scan cannot be cancelled (already completed or failed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /scans/{scan_id}/status:
+    get:
+      tags:
+        - scans
+      summary: Get scan status
+      description: |
+        Retrieve the current status of a scan.
+        This endpoint is optimized for polling and returns minimal data.
+      operationId: getScanStatus
+      parameters:
+        - $ref: '#/components/parameters/ScanId'
+      responses:
+        '200':
+          description: Scan status retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScanStatus'
+              example:
+                scan_id: "550e8400-e29b-41d4-a716-446655440000"
+                status: "running"
+                progress: 45
+                message: "Scanning ports 1-1000"
+                updated_at: "2025-10-22T10:32:15Z"
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /scans/{scan_id}/raw_results:
+    get:
+      tags:
+        - scans
+      summary: Get raw scan results
+      description: |
+        Retrieve the raw output from the scanning tool.
+        This includes unparsed XML, JSON, or text output as produced by the tool.
+      operationId: getRawResults
+      parameters:
+        - $ref: '#/components/parameters/ScanId'
+        - name: format
+          in: query
+          description: Desired output format
+          schema:
+            type: string
+            enum: [json, xml, text]
+            default: json
+      responses:
+        '200':
+          description: Raw results retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RawResults'
+            application/xml:
+              schema:
+                type: string
+            text/plain:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Scan not yet completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /scans/{scan_id}/parsed_results:
+    get:
+      tags:
+        - scans
+      summary: Get parsed scan results
+      description: |
+        Retrieve normalized and parsed scan results.
+        This endpoint returns structured data that has been processed and standardized.
+      operationId: getParsedResults
+      parameters:
+        - $ref: '#/components/parameters/ScanId'
+      responses:
+        '200':
+          description: Parsed results retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParsedResults'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Scan not yet completed or results not parsed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /health:
+    get:
+      tags:
+        - health
+      summary: Health check endpoint
+      description: Check the health status of the API and its dependencies
+      operationId: healthCheck
+      responses:
+        '200':
+          description: System is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          description: System is unhealthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+  
+  # 🆕 Phase 2: Export Endpoints
+  /scans/{scanId}/export/{format}:
+    get:
+      tags:
+        - scans
+      summary: Export scan results
+      description: |
+        Export scan results in various formats (JSON, CSV, XLSX, PDF).
+        Returns a downloadable file with scan metadata, vulnerabilities, and summary statistics.
+      operationId: exportScan
+      parameters:
+        - name: scanId
+          in: path
+          required: true
+          description: Unique scan identifier
+          schema:
+            type: string
+            format: uuid
+        - name: format
+          in: path
+          required: true
+          description: Export format
+          schema:
+            type: string
+            enum: [json, csv, xlsx, pdf]
+      responses:
+        '200':
+          description: File download
+          content:
+            application/json:
+              schema:
+                type: object
+                description: Complete scan data export (format=json)
+            text/csv:
+              schema:
+                type: string
+                description: CSV export with vulnerability data (format=csv)
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+                description: Excel workbook with 3 sheets (format=xlsx)
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+                description: Professional PDF report (format=pdf)
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          description: Invalid format
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  
+  # 🆕 Phase 2: Bulk Operations
+  /scans/bulk/delete:
+    post:
+      tags:
+        - scans
+      summary: Delete multiple scans
+      description: |
+        Deletes multiple scans and all associated data.
+        Maximum 100 scans per request.
+      operationId: bulkDeleteScans
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - scan_ids
+              properties:
+                scan_ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+                  maxItems: 100
+            example:
+              scan_ids:
+                - "550e8400-e29b-41d4-a716-446655440000"
+                - "550e8400-e29b-41d4-a716-446655440001"
+      responses:
+        '200':
+          description: Bulk delete completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: integer
+                  total:
+                    type: integer
+                  failed:
+                    type: array
+                    items:
+                      type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  
+  /scans/bulk/export:
+    post:
+      tags:
+        - scans
+      summary: Export multiple scans as ZIP
+      description: |
+        Exports multiple scans and packages them into a ZIP archive.
+        Maximum 50 scans per request.
+      operationId: bulkExportScans
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - scan_ids
+              properties:
+                scan_ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+                  maxItems: 50
+                format:
+                  type: string
+                  enum: [json, csv, xlsx, pdf]
+                  default: pdf
+            example:
+              scan_ids:
+                - "550e8400-e29b-41d4-a716-446655440000"
+              format: "pdf"
+      responses:
+        '200':
+          description: ZIP file download
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  parameters:
+    ScanId:
+      name: scan_id
+      in: path
+      required: true
+      description: Unique identifier for the scan
+      schema:
+        type: string
+        format: uuid
+      example: "550e8400-e29b-41d4-a716-446655440000"
+
+  schemas:
+    ScanRequest:
+      type: object
+      required:
+        - target
+        - tool
+        - scan_type
+      properties:
+        target:
+          type: string
+          description: Target IP address, hostname, or CIDR range
+          example: "192.168.1.1"
+        tool:
+          type: string
+          description: Scanning tool to use
+          enum: [nmap, openvas, nessus, nikto, nuclei]
+          example: "nmap"
+        scan_type:
+          type: string
+          description: Type of scan to perform
+          enum: [basic, full, quick, custom]
+          example: "basic"
+        options:
+          type: object
+          description: Tool-specific options
+          additionalProperties: true
+          example:
+            ports: "1-1000"
+            timing: "T4"
+            scripts: "default,vuln"
+        priority:
+          type: string
+          description: Scan priority
+          enum: [low, normal, high]
+          default: normal
+        tags:
+          type: array
+          description: User-defined tags for categorization
+          items:
+            type: string
+          example: ["production", "web-servers"]
+
+    ScanResponse:
+      type: object
+      properties:
+        scan_id:
+          type: string
+          format: uuid
+          description: Unique scan identifier
+        status:
+          type: string
+          enum: [pending, running, completed, failed, cancelled]
+          description: Current scan status
+        target:
+          type: string
+          description: Scan target
+        tool:
+          type: string
+          description: Tool being used
+        scan_type:
+          type: string
+          description: Type of scan
+        created_at:
+          type: string
+          format: date-time
+          description: Scan creation timestamp
+        message:
+          type: string
+          description: Status message
+
+    ScanDetail:
+      allOf:
+        - $ref: '#/components/schemas/ScanResponse'
+        - type: object
+          properties:
+            completed_at:
+              type: string
+              format: date-time
+              description: Scan completion timestamp
+              nullable: true
+            duration:
+              type: integer
+              description: Scan duration in seconds
+              nullable: true
+            options:
+              type: object
+              description: Scan options used
+            error_message:
+              type: string
+              description: Error message if scan failed
+              nullable: true
+            tags:
+              type: array
+              items:
+                type: string
+
+    ScanStatus:
+      type: object
+      properties:
+        scan_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, running, completed, failed, cancelled]
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Scan progress percentage
+        message:
+          type: string
+          description: Current status message
+        updated_at:
+          type: string
+          format: date-time
+
+    ScanList:
+      type: object
+      properties:
+        scans:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScanDetail'
+        pagination:
+          type: object
+          properties:
+            page:
+              type: integer
+            limit:
+              type: integer
+            total_pages:
+              type: integer
+            total_items:
+              type: integer
+
+    RawResults:
+      type: object
+      properties:
+        scan_id:
+          type: string
+          format: uuid
+        tool:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        format:
+          type: string
+          enum: [xml, json, text]
+        raw_output:
+          type: string
+          description: Raw tool output as string
+
+    ParsedResults:
+      type: object
+      properties:
+        scan_id:
+          type: string
+          format: uuid
+        tool:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        summary:
+          type: object
+          properties:
+            hosts_scanned:
+              type: integer
+            hosts_up:
+              type: integer
+            total_ports:
+              type: integer
+            open_ports:
+              type: integer
+            vulnerabilities_found:
+              type: integer
+        hosts:
+          type: array
+          items:
+            $ref: '#/components/schemas/HostResult'
+
+    HostResult:
+      type: object
+      properties:
+        ip_address:
+          type: string
+        hostname:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [up, down, unknown]
+        os:
+          type: object
+          properties:
+            name:
+              type: string
+            accuracy:
+              type: integer
+          nullable: true
+        ports:
+          type: array
+          items:
+            $ref: '#/components/schemas/PortResult'
+        vulnerabilities:
+          type: array
+          items:
+            $ref: '#/components/schemas/VulnerabilityResult'
+
+    PortResult:
+      type: object
+      properties:
+        port:
+          type: integer
+        protocol:
+          type: string
+          enum: [tcp, udp]
+        state:
+          type: string
+          enum: [open, closed, filtered]
+        service:
+          type: object
+          properties:
+            name:
+              type: string
+            product:
+              type: string
+            version:
+              type: string
+
+    VulnerabilityResult:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Vulnerability identifier (CVE, etc.)
+        name:
+          type: string
+        severity:
+          type: string
+          enum: [critical, high, medium, low, info]
+        cvss_score:
+          type: number
+          minimum: 0
+          maximum: 10
+          nullable: true
+        description:
+          type: string
+        affected_component:
+          type: string
+        solution:
+          type: string
+          nullable: true
+
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, unhealthy]
+        timestamp:
+          type: string
+          format: date-time
+        components:
+          type: object
+          properties:
+            database:
+              $ref: '#/components/schemas/ComponentHealth'
+            redis:
+              $ref: '#/components/schemas/ComponentHealth'
+            wsl:
+              $ref: '#/components/schemas/ComponentHealth'
+
+    ComponentHealth:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [up, down, degraded]
+        message:
+          type: string
+        response_time_ms:
+          type: integer
+          nullable: true
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error code
+        message:
+          type: string
+          description: Human-readable error message
+        details:
+          type: object
+          description: Additional error details
+          additionalProperties: true
+        timestamp:
+          type: string
+          format: date-time
+
+  responses:
+    BadRequest:
+      description: Invalid request parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "BAD_REQUEST"
+            message: "Invalid target format"
+            details:
+              field: "target"
+              reason: "Must be a valid IP address or CIDR range"
+            timestamp: "2025-10-22T10:30:00Z"
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "NOT_FOUND"
+            message: "Scan not found"
+            details:
+              scan_id: "550e8400-e29b-41d4-a716-446655440000"
+            timestamp: "2025-10-22T10:30:00Z"
+
+    UnprocessableEntity:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "VALIDATION_ERROR"
+            message: "Request validation failed"
+            details:
+              errors:
+                - field: "tool"
+                  message: "Tool 'invalid_tool' is not supported"
+            timestamp: "2025-10-22T10:30:00Z"
+
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "INTERNAL_ERROR"
+            message: "An unexpected error occurred"
+            timestamp: "2025-10-22T10:30:00Z"

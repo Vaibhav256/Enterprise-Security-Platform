@@ -1,0 +1,28 @@
+# Intelligence Layer Dependencies
+
+# Core RAG Components
+sentence-transformers==2.2.2      # Embedding model for semantic search
+chromadb==0.4.22                  # Vector database for retrieval
+networkx==3.2.1                   # Graph database for attack paths
+
+# LLM Interaction
+requests==2.31.0                  # HTTP client for Ollama API
+redis==5.0.1                      # Redis client for session persistence
+
+# NLP & Text Processing
+spacy==3.7.2                      # Named entity recognition
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0-py3-none-any.whl  # spaCy English model
+
+# Data Handling
+numpy==1.26.3                     # Numerical operations
+pandas==2.2.0                     # Data manipulation
+
+# Visualization (for attack graph rendering)
+matplotlib==3.8.2                 # Static graph visualization
+plotly==5.18.0                    # Interactive graph visualization
+
+# Performance Monitoring
+tqdm==4.66.1                      # Progress bars for indexing
+
+# Optional: Advanced Retrieval
+# cross-encoder/ms-marco-MiniLM-L-6-v2  # For reranking (loaded via sentence-transformers)

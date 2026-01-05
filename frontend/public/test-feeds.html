@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Feeds API Test</title>
+</head>
+<body>
+    <h1>Threat Feeds API Test</h1>
+    <div id="output"></div>
+    <script>
+        async function test() {
+            const output = document.getElementById('output');
+            output.innerHTML = '<p>Testing... </p>';
+            
+            try {
+                const response = await fetch('/api/feeds/status');
+                const data = await response.json();
+                output.innerHTML = `<pre>${JSON.stringify(data, null, 2)}</pre>`;
+            } catch (error) {
+                output.innerHTML = `<p>Error: ${error.message}</p>`;
+            }
+        }
+        
+        test();
+    </script>
+</body>
+</html>

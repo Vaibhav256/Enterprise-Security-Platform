@@ -1,0 +1,858 @@
+"""
+API Routes
+
+REST API endpoints for scan management, execution, and results retrieval.
+Implements the OpenAPI specification defined in docs/api_spec.yaml
+
+Author: NTRO Security Team
+Date: 2025-10-22
+"""
+
+import os
+import sys
+from datetime import datetime
+from typing import Dict, List, Optional
+import logging
+
+from flask import request, jsonify
+from flask_restx import Namespace, Resource, fields
+from werkzeug.exceptions import BadRequest, NotFound
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from services.scan_orchestrator.orchestrator import ScanOrchestrator
+from services.data_ingestor.ingestor import DataIngestor
+from services.data_ingestor.models import ScanStatus
+from config.config import get_config
+
+logger = logging.getLogger(__name__)
+
+
+# Initialize services
+config = get_config(os.getenv('FLASK_ENV', 'development'))
+orchestrator = ScanOrchestrator(
+    redis_host=config.REDIS_HOST,
+    redis_port=config.REDIS_PORT
+)
+ingestor = DataIngestor(database_url=config.DATABASE_URL)
+
+# Create namespaces
+scans_ns = Namespace('scans', description='Scan management operations')
+
+
+# API Models for documentation and validation
+scan_request_model = scans_ns.model('ScanRequest', {
+    'target': fields.String(required=True, description='Target IP, hostname, or CIDR range', example='192.168.1.1'),
+    'tool_name': fields.String(required=True, description='Scanner tool name', enum=['nmap', 'openvas', 'nessus', 'nikto'], example='nmap'),
+    'scan_type': fields.String(required=True, description='Type of scan to perform', example='basic'),
+    'priority': fields.String(required=False, description='Scan priority', enum=['high', 'normal', 'low'], default='normal'),
+    'options': fields.Raw(required=False, description='Additional tool-specific options', example={}),
+    'tags': fields.List(fields.String, required=False, description='Tags for categorizing scans', example=['production', 'web-server'])
+})
+
+scan_response_model = scans_ns.model('ScanResponse', {
+    'scan_id': fields.String(description='Unique scan identifier'),
+    'target': fields.String(description='Scan target'),
+    'tool_name': fields.String(description='Scanner tool'),
+    'scan_type': fields.String(description='Scan type'),
+    'status': fields.String(description='Current scan status'),
+    'priority': fields.String(description='Scan priority'),
+    'created_at': fields.DateTime(description='Scan creation timestamp'),
+    'job_id': fields.String(description='Job queue identifier')
+})
+
+scan_detail_model = scans_ns.model('ScanDetail', {
+    'scan_id': fields.String(description='Unique scan identifier'),
+    'target': fields.String(description='Scan target'),
+    'tool_name': fields.String(description='Scanner tool'),
+    'scan_type': fields.String(description='Scan type'),
+    'status': fields.String(description='Current scan status'),
+    'progress': fields.Integer(description='Scan progress percentage (0-100)'),
+    'priority': fields.String(description='Scan priority'),
+    'created_at': fields.DateTime(description='Creation timestamp'),
+    'started_at': fields.DateTime(description='Start timestamp'),
+    'completed_at': fields.DateTime(description='Completion timestamp'),
+    'execution_time': fields.Float(description='Execution time in seconds'),
+    'error_message': fields.String(description='Error message if failed'),
+    'options': fields.Raw(description='Scan options'),
+    'tags': fields.List(fields.String, description='Scan tags'),
+    'job_id': fields.String(description='Job queue identifier')
+})
+
+scan_list_model = scans_ns.model('ScanList', {
+    'scans': fields.List(fields.Nested(scan_response_model)),
+    'total': fields.Integer(description='Total number of scans'),
+    'page': fields.Integer(description='Current page number'),
+    'per_page': fields.Integer(description='Items per page')
+})
+
+scan_status_model = scans_ns.model('ScanStatus', {
+    'scan_id': fields.String(description='Scan identifier'),
+    'status': fields.String(description='Current status'),
+    'progress': fields.Integer(description='Progress percentage'),
+    'job_status': fields.String(description='Job queue status'),
+    'started_at': fields.DateTime(description='Start time'),
+    'execution_time': fields.Float(description='Execution time in seconds')
+})
+
+
+@scans_ns.route('/')
+class ScanList(Resource):
+    """Scan collection endpoint"""
+    
+    @scans_ns.doc('list_scans')
+    @scans_ns.param('status', 'Filter by status', type=str)
+    @scans_ns.param('tool_name', 'Filter by tool', type=str)
+    @scans_ns.param('page', 'Page number', type=int, default=1)
+    @scans_ns.param('per_page', 'Items per page', type=int, default=20)
+    @scans_ns.marshal_with(scan_list_model)
+    def get(self):
+        """List all scans with optional filtering"""
+        try:
+            # Get query parameters
+            status_param = request.args.get('status')
+            tool_name = request.args.get('tool_name')
+            page = int(request.args.get('page', 1))
+            per_page = int(request.args.get('per_page', 20))
+            
+            # Convert status string to enum
+            status = None
+            if status_param:
+                try:
+                    status = ScanStatus[status_param.upper()]
+                except KeyError:
+                    raise BadRequest(f"Invalid status: {status_param}")
+            
+            # Get scans
+            scans, total = ingestor.list_scans(
+                status=status,
+                tool=tool_name,
+                limit=per_page,
+                offset=(page - 1) * per_page
+            )
+            
+            # Convert to response format
+            scan_list = []
+            for scan in scans:
+                scan_list.append({
+                    'scan_id': str(scan.scan_id),
+                    'target': scan.target,
+                    'tool_name': scan.tool_name,
+                    'scan_type': scan.scan_type,
+                    'status': scan.status.value,
+                    'priority': scan.priority,
+                    'created_at': scan.created_at.isoformat() if scan.created_at else None,
+                    'job_id': scan.job_id
+                })
+            
+            return {
+                'scans': scan_list,
+                'total': total,
+                'page': page,
+                'per_page': per_page
+            }
+            
+        except BadRequest:
+            raise
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            logger.error(f"Error listing scans: {error_details}")
+            scans_ns.abort(500, f"Failed to list scans: {type(e).__name__}: {str(e)}")
+    
+    @scans_ns.doc('create_scan')
+    @scans_ns.expect(scan_request_model, validate=True)
+    @scans_ns.marshal_with(scan_response_model, code=201)
+    def post(self):
+        """Create and enqueue a new scan"""
+        try:
+            import uuid
+            data = request.json
+            
+            # Validate required fields
+            required_fields = ['target', 'tool_name', 'scan_type']
+            for field in required_fields:
+                if field not in data:
+                    raise BadRequest(f"Missing required field: {field}")
+            
+            # Generate scan ID
+            scan_id = str(uuid.uuid4())
+            
+            # Create scan record in database (initial status: PENDING)
+            scan = ingestor.create_scan(
+                scan_id=scan_id,
+                target=data['target'],
+                tool_name=data['tool_name'],
+                scan_type=data['scan_type'],
+                options=data.get('options', {}),
+                tags=data.get('tags', []),
+                priority=data.get('priority', 'normal'),
+                job_id=None  # Will be updated after enqueuing
+            )
+            
+            # Enqueue scan job
+            job_id = orchestrator.enqueue_scan(
+                scan_id=scan_id,
+                target=data['target'],
+                tool=data['tool_name'],
+                scan_type=data['scan_type'],
+                options=data.get('options', {}),
+                priority=data.get('priority', 'normal')
+            )
+            
+            # Update the scan with job_id and status
+            session = ingestor.get_session()
+            try:
+                from services.data_ingestor.models import Scan
+                scan_obj = session.query(Scan).filter(Scan.scan_id == scan_id).first()
+                if scan_obj:
+                    scan_obj.status = ScanStatus.PENDING  # Set to PENDING (queued status)
+                    scan_obj.job_id = job_id
+                    session.commit()
+            finally:
+                session.close()
+            
+            # Refresh scan to get updated data
+            scan = ingestor.get_scan(scan_id)
+            
+            return {
+                'scan_id': scan_id,
+                'target': scan.target,
+                'tool_name': scan.tool_name,
+                'scan_type': scan.scan_type,
+                'status': scan.status.value,
+                'priority': scan.priority,
+                'created_at': scan.created_at.isoformat(),
+                'job_id': job_id
+            }, 201
+            
+        except BadRequest:
+            raise
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            logger.error(f"Error creating scan: {error_details}")
+            scans_ns.abort(500, f"Failed to create scan: {type(e).__name__}: {str(e)}")
+
+
+@scans_ns.route('/<string:scan_id>')
+@scans_ns.param('scan_id', 'The scan identifier')
+class Scan(Resource):
+    """Single scan endpoint"""
+    
+    @scans_ns.doc('get_scan')
+    @scans_ns.marshal_with(scan_detail_model)
+    def get(self, scan_id):
+        """Get detailed scan information"""
+        try:
+            scan = ingestor.get_scan(scan_id)
+            
+            if not scan:
+                raise NotFound(f"Scan {scan_id} not found")
+            
+            return {
+                'scan_id': str(scan.scan_id),
+                'target': scan.target,
+                'tool_name': scan.tool_name,
+                'scan_type': scan.scan_type,
+                'status': scan.status.value,
+                'progress': scan.progress,
+                'priority': scan.priority,
+                'created_at': scan.created_at.isoformat() if scan.created_at else None,
+                'started_at': scan.started_at.isoformat() if scan.started_at else None,
+                'completed_at': scan.completed_at.isoformat() if scan.completed_at else None,
+                'execution_time': scan.execution_time,
+                'error_message': scan.error_message,
+                'options': scan.options,
+                'tags': scan.tags,
+                'job_id': scan.job_id
+            }
+            
+        except NotFound:
+            raise
+        except Exception as e:
+            scans_ns.abort(500, f"Failed to get scan: {str(e)}")
+    
+    @scans_ns.doc('delete_scan')
+    @scans_ns.response(204, 'Scan deleted/cancelled')
+    def delete(self, scan_id):
+        """Cancel and delete a scan"""
+        try:
+            scan = ingestor.get_scan(scan_id)
+            
+            if not scan:
+                raise NotFound(f"Scan {scan_id} not found")
+            
+            # Cancel job if queued or running
+            if scan.job_id and scan.status in [ScanStatus.QUEUED, ScanStatus.RUNNING]:
+                orchestrator.cancel_job(scan.job_id)
+            
+            # Delete scan
+            ingestor.delete_scan(scan_id)
+            
+            return '', 204
+            
+        except NotFound:
+            raise
+        except Exception as e:
+            scans_ns.abort(500, f"Failed to delete scan: {str(e)}")
+
+
+@scans_ns.route('/<string:scan_id>/status')
+@scans_ns.param('scan_id', 'The scan identifier')
+class ScanStatusResource(Resource):
+    """Scan status endpoint"""
+    
+    @scans_ns.doc('get_scan_status')
+    @scans_ns.marshal_with(scan_status_model)
+    def get(self, scan_id):
+        """Get current scan status"""
+        try:
+            scan = ingestor.get_scan(scan_id)
+            
+            if not scan:
+                raise NotFound(f"Scan {scan_id} not found")
+            
+            # Get job status if available
+            job_status = None
+            if scan.job_id:
+                job_info = orchestrator.get_job_status(scan.job_id)
+                job_status = job_info.get('status') if job_info else None
+            
+            return {
+                'scan_id': str(scan.scan_id),
+                'status': scan.status.value,
+                'progress': scan.progress,
+                'job_status': job_status,
+                'started_at': scan.started_at.isoformat() if scan.started_at else None,
+                'execution_time': scan.execution_time
+            }
+            
+        except NotFound:
+            raise
+        except Exception as e:
+            scans_ns.abort(500, f"Failed to get scan status: {str(e)}")
+
+
+@scans_ns.route('/<string:scan_id>/raw_results')
+@scans_ns.param('scan_id', 'The scan identifier')
+class ScanRawResults(Resource):
+    """Raw scan results endpoint"""
+    
+    @scans_ns.doc('get_raw_results')
+    def get(self, scan_id):
+        """Get raw scan output"""
+        try:
+            results = ingestor.get_raw_results(scan_id)
+            
+            if not results:
+                raise NotFound(f"No results found for scan {scan_id}")
+            
+            # Convert to response format
+            result_list = []
+            for result in results:
+                result_list.append({
+                    'id': str(result.id),
+                    'scan_id': str(result.scan_id),
+                    'tool_name': result.tool_name,
+                    'raw_output': result.raw_output,
+                    'output_format': result.output_format,
+                    'timestamp': result.timestamp.isoformat() if result.timestamp else None,
+                    'file_size': result.file_size
+                })
+            
+            return {'results': result_list}
+            
+        except NotFound:
+            raise
+        except Exception as e:
+            scans_ns.abort(500, f"Failed to get raw results: {str(e)}")
+
+
+@scans_ns.route('/<string:scan_id>/parsed_results')
+@scans_ns.param('scan_id', 'The scan identifier')
+class ScanParsedResults(Resource):
+    """Parsed scan results endpoint"""
+    
+    @scans_ns.doc('get_parsed_results')
+    def get(self, scan_id):
+        """Get parsed scan results and summary"""
+        try:
+            # Get raw results with parsed output
+            results = ingestor.get_raw_results(scan_id)
+            
+            if not results:
+                raise NotFound(f"No results found for scan {scan_id}")
+            
+            # Get scan summary
+            summary = ingestor.get_scan_summary(scan_id)
+            
+            response = {
+                'scan_id': scan_id,
+                'parsed_results': [],
+                'summary': None
+            }
+            
+            # Add parsed results
+            for result in results:
+                if result.parsed_output:
+                    response['parsed_results'].append({
+                        'tool_name': result.tool_name,
+                        'data': result.parsed_output,
+                        'timestamp': result.timestamp.isoformat() if result.timestamp else None
+                    })
+            
+            # Add summary
+            if summary:
+                response['summary'] = {
+                    'hosts_scanned': summary.hosts_scanned,
+                    'hosts_up': summary.hosts_up,
+                    'total_ports': summary.total_ports,
+                    'open_ports': summary.open_ports,
+                    'vulnerabilities_found': summary.vulnerabilities_found,
+                    'severity_counts': {
+                        'critical': summary.critical_count,
+                        'high': summary.high_count,
+                        'medium': summary.medium_count,
+                        'low': summary.low_count,
+                        'info': summary.info_count
+                    },
+                    'additional_data': summary.summary_data
+                }
+            
+            return response
+            
+        except NotFound:
+            raise
+        except Exception as e:
+            scans_ns.abort(500, f"Failed to get parsed results: {str(e)}")
+
+
+@scans_ns.route('/<string:scan_id>/export/<string:format>')
+@scans_ns.param('scan_id', 'The scan identifier')
+@scans_ns.param('format', 'Export format (json, csv, xlsx, pdf)')
+class ScanExport(Resource):
+    """Scan export endpoint"""
+    
+    @scans_ns.doc('export_scan')
+    def get(self, scan_id, format):
+        """Export scan results in specified format"""
+        from flask import send_file
+        from services.export_service.exporters import ExportManager
+        from datetime import datetime
+        
+        try:
+            # Validate format
+            valid_formats = ['json', 'csv', 'xlsx', 'pdf']
+            format = format.lower()
+            
+            if format not in valid_formats:
+                scans_ns.abort(400, f"Invalid export format. Supported: {', '.join(valid_formats)}")
+            
+            # Get scan data
+            scan = ingestor.get_scan(scan_id)
+            if not scan:
+                raise NotFound(f"Scan {scan_id} not found")
+            
+            # Get parsed results
+            results = ingestor.get_raw_results(scan_id)
+            summary = ingestor.get_scan_summary(scan_id)
+            
+            # Build complete scan data
+            scan_data = scan.to_dict()
+            scan_data['parsed_results'] = []
+            
+            for result in results:
+                if result.parsed_output:
+                    scan_data['parsed_results'].append({
+                        'tool_name': result.tool_name,
+                        'data': result.parsed_output,
+                        'timestamp': result.timestamp.isoformat() if result.timestamp else None
+                    })
+            
+            # Add summary
+            if summary:
+                scan_data['summary'] = {
+                    'hosts_scanned': summary.hosts_scanned,
+                    'hosts_up': summary.hosts_up,
+                    'total_ports': summary.total_ports,
+                    'open_ports': summary.open_ports,
+                    'vulnerabilities_found': summary.vulnerabilities_found,
+                    'critical_count': summary.critical_count,
+                    'high_count': summary.high_count,
+                    'medium_count': summary.medium_count,
+                    'low_count': summary.low_count,
+                    'info_count': summary.info_count,
+                    'additional_data': summary.summary_data
+                }
+            else:
+                # Create empty summary if not available
+                scan_data['summary'] = {
+                    'hosts_scanned': 0,
+                    'hosts_up': 0,
+                    'total_ports': 0,
+                    'open_ports': 0,
+                    'vulnerabilities_found': 0,
+                    'critical_count': 0,
+                    'high_count': 0,
+                    'medium_count': 0,
+                    'low_count': 0,
+                    'info_count': 0,
+                    'additional_data': {}
+                }
+            
+            # Export scan data
+            output_buffer = ExportManager.export_scan(scan_data, format)
+            
+            # Generate filename
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"scan_{scan_data.get('target', 'unknown')}_{timestamp}.{format}"
+            
+            # Get content type
+            content_type = ExportManager.get_content_type(format)
+            
+            # Send file
+            return send_file(
+                output_buffer,
+                mimetype=content_type,
+                as_attachment=True,
+                download_name=filename
+            )
+            
+        except NotFound:
+            raise
+        except ValueError as e:
+            scans_ns.abort(400, str(e))
+        except Exception as e:
+            logger.error(f"Export failed: {e}", exc_info=True)
+            scans_ns.abort(500, f"Failed to export scan: {str(e)}")
+
+
+# Create additional namespaces
+tools_ns = Namespace('tools', description='Scanning tools information')
+stats_ns = Namespace('stats', description='Platform statistics')
+
+
+@tools_ns.route('/')
+class ToolsList(Resource):
+    """Available scanning tools endpoint"""
+    
+    @tools_ns.doc('list_tools')
+    def get(self):
+        """Get list of available scanning tools with their capabilities"""
+        try:
+            tools = [
+                {
+                    'name': 'nmap',
+                    'display_name': 'Nmap',
+                    'description': 'Network port scanner and service detection tool',
+                    'category': 'Network Scanner',
+                    'supported_scan_types': ['quick', 'basic', 'full', 'stealth', 'custom'],
+                    'capabilities': ['Port Scanning', 'Service Detection', 'OS Detection', 'Script Scanning']
+                },
+                {
+                    'name': 'openvas',
+                    'display_name': 'OpenVAS',
+                    'description': 'Comprehensive vulnerability assessment scanner',
+                    'category': 'Vulnerability Scanner',
+                    'supported_scan_types': ['basic', 'full', 'discovery', 'system', 'custom'],
+                    'capabilities': ['CVE Detection', 'Misconfiguration', 'Patch Management', 'Compliance']
+                },
+                {
+                    'name': 'nessus',
+                    'display_name': 'Nessus',
+                    'description': 'Enterprise vulnerability scanner (commercial)',
+                    'category': 'Vulnerability Scanner',
+                    'supported_scan_types': ['basic', 'advanced', 'compliance', 'custom'],
+                    'capabilities': ['CVE Detection', 'Compliance Audits', 'Malware Detection', 'Remediation']
+                },
+                {
+                    'name': 'nikto',
+                    'display_name': 'Nikto',
+                    'description': 'Web server scanner for vulnerabilities and misconfigurations',
+                    'category': 'Web Scanner',
+                    'supported_scan_types': ['quick', 'basic', 'full', 'ssl', 'custom'],
+                    'capabilities': ['Dangerous Files', 'Outdated Software', 'Server Config', 'SSL/TLS Issues']
+                },
+                {
+                    'name': 'nuclei',
+                    'display_name': 'Nuclei',
+                    'description': 'Fast template-based vulnerability scanner',
+                    'category': 'Web Scanner',
+                    'supported_scan_types': ['basic', 'full', 'cve', 'misconfig', 'exposed', 'custom'],
+                    'capabilities': ['CVE Detection', 'Misconfigurations', 'Exposed Panels', 'Template-based']
+                }
+            ]
+            
+            return {'tools': tools, 'count': len(tools)}
+            
+        except Exception as e:
+            tools_ns.abort(500, f"Failed to list tools: {str(e)}")
+
+
+@stats_ns.route('/')
+class StatsResource(Resource):
+    """Statistics endpoint"""
+    
+    @stats_ns.doc('get_stats')
+    def get(self):
+        """Get overall scan statistics"""
+        try:
+            # Get all scans
+            all_scans, total_count = ingestor.list_scans(limit=10000, offset=0)
+            
+            # Calculate statistics
+            stats = {
+                'total_scans': total_count,
+                'status_breakdown': {
+                    'pending': 0,
+                    'queued': 0,
+                    'running': 0,
+                    'completed': 0,
+                    'failed': 0,
+                    'cancelled': 0
+                },
+                'tool_usage': {},
+                'scan_type_usage': {},
+                'vulnerabilities': {
+                    'total': 0,
+                    'critical': 0,
+                    'high': 0,
+                    'medium': 0,
+                    'low': 0,
+                    'info': 0
+                }
+            }
+            
+            # Aggregate data
+            for scan in all_scans:
+                # Status breakdown
+                if scan.status:
+                    status_key = scan.status.value.lower()
+                    if status_key in stats['status_breakdown']:
+                        stats['status_breakdown'][status_key] += 1
+                
+                # Tool usage
+                if scan.tool_name:
+                    stats['tool_usage'][scan.tool_name] = stats['tool_usage'].get(scan.tool_name, 0) + 1
+                
+                # Scan type usage
+                if scan.scan_type:
+                    stats['scan_type_usage'][scan.scan_type] = stats['scan_type_usage'].get(scan.scan_type, 0) + 1
+            
+            # Get vulnerability summary
+            try:
+                session = ingestor.get_session()
+                from services.data_ingestor.models import ScanSummary
+                summaries = session.query(ScanSummary).all()
+                
+                for summary in summaries:
+                    stats['vulnerabilities']['total'] += summary.vulnerabilities_found or 0
+                    stats['vulnerabilities']['critical'] += summary.critical_count or 0
+                    stats['vulnerabilities']['high'] += summary.high_count or 0
+                    stats['vulnerabilities']['medium'] += summary.medium_count or 0
+                    stats['vulnerabilities']['low'] += summary.low_count or 0
+                    stats['vulnerabilities']['info'] += summary.info_count or 0
+                
+                session.close()
+            except Exception as e:
+                logger.warning(f"Could not fetch vulnerability stats: {str(e)}")
+            
+            # Calculate additional metrics
+            completed_scans = stats['status_breakdown']['completed']
+            failed_scans = stats['status_breakdown']['failed']
+            total_finished = completed_scans + failed_scans
+            
+            stats['success_rate'] = (
+                round((completed_scans / total_finished * 100), 2)
+                if total_finished > 0 else 0
+            )
+            
+            stats['active_scans'] = (
+                stats['status_breakdown']['pending'] +
+                stats['status_breakdown']['queued'] +
+                stats['status_breakdown']['running']
+            )
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting stats: {str(e)}")
+            stats_ns.abort(500, f"Failed to get statistics: {str(e)}")
+
+
+# 🆕 Phase 2 Day 8: Bulk Operations Endpoints
+bulk_delete_model = scans_ns.model('BulkDeleteRequest', {
+    'scan_ids': fields.List(fields.String, required=True, description='List of scan IDs to delete', example=['scan-123', 'scan-456'])
+})
+
+bulk_delete_response_model = scans_ns.model('BulkDeleteResponse', {
+    'deleted': fields.Integer(description='Number of scans successfully deleted'),
+    'total': fields.Integer(description='Total number of scans requested'),
+    'failed': fields.List(fields.String, description='List of scan IDs that failed to delete')
+})
+
+bulk_export_model = scans_ns.model('BulkExportRequest', {
+    'scan_ids': fields.List(fields.String, required=True, description='List of scan IDs to export'),
+    'format': fields.String(required=False, description='Export format', enum=['json', 'csv', 'xlsx', 'pdf'], default='pdf')
+})
+
+
+@scans_ns.route('/bulk/delete')
+class BulkDelete(Resource):
+    """Bulk delete scans endpoint"""
+    
+    @scans_ns.doc('bulk_delete_scans')
+    @scans_ns.expect(bulk_delete_model)
+    @scans_ns.response(200, 'Scans deleted successfully', bulk_delete_response_model)
+    @scans_ns.response(400, 'Invalid request')
+    @scans_ns.response(500, 'Internal server error')
+    def post(self):
+        """
+        Delete multiple scans
+        
+        Deletes multiple scans and all associated data (raw results, parsed results, summaries)
+        """
+        try:
+            data = request.get_json()
+            scan_ids = data.get('scan_ids', [])
+            
+            if not scan_ids:
+                scans_ns.abort(400, "No scan IDs provided")
+            
+            if len(scan_ids) > 100:
+                scans_ns.abort(400, "Cannot delete more than 100 scans at once")
+            
+            logger.info(f"🗑️ Bulk delete request for {len(scan_ids)} scans")
+            
+            deleted = 0
+            failed = []
+            
+            for scan_id in scan_ids:
+                try:
+                    # Delete from all tables
+                    ingestor.delete_scan(scan_id)
+                    ingestor.delete_raw_results(scan_id)
+                    ingestor.delete_parsed_results(scan_id)
+                    ingestor.delete_summary(scan_id)
+                    deleted += 1
+                    logger.info(f"✅ Deleted scan {scan_id}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to delete {scan_id}: {str(e)}")
+                    failed.append(scan_id)
+            
+            logger.info(f"🎯 Bulk delete complete: {deleted}/{len(scan_ids)} successful")
+            
+            return {
+                'deleted': deleted,
+                'total': len(scan_ids),
+                'failed': failed
+            }, 200
+            
+        except BadRequest as e:
+            raise e
+        except Exception as e:
+            logger.error(f"Error in bulk delete: {str(e)}")
+            scans_ns.abort(500, f"Bulk delete failed: {str(e)}")
+
+
+@scans_ns.route('/bulk/export')
+class BulkExport(Resource):
+    """Bulk export scans endpoint"""
+    
+    @scans_ns.doc('bulk_export_scans')
+    @scans_ns.expect(bulk_export_model)
+    @scans_ns.response(200, 'ZIP file with exported scans')
+    @scans_ns.response(400, 'Invalid request')
+    @scans_ns.response(500, 'Internal server error')
+    def post(self):
+        """
+        Export multiple scans as ZIP
+        
+        Creates a ZIP archive containing exported scan results in the specified format
+        """
+        import zipfile
+        import io
+        from flask import send_file
+        from services.export_service.exporters import ExportManager
+        
+        try:
+            data = request.get_json()
+            scan_ids = data.get('scan_ids', [])
+            format_type = data.get('format', 'pdf')
+            
+            if not scan_ids:
+                scans_ns.abort(400, "No scan IDs provided")
+            
+            if len(scan_ids) > 50:
+                scans_ns.abort(400, "Cannot export more than 50 scans at once")
+            
+            if format_type not in ['json', 'csv', 'xlsx', 'pdf']:
+                scans_ns.abort(400, f"Unsupported format: {format_type}")
+            
+            logger.info(f"📦 Bulk export request for {len(scan_ids)} scans in {format_type} format")
+            
+            export_manager = ExportManager(ingestor)
+            zip_buffer = io.BytesIO()
+            
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                exported_count = 0
+                
+                for scan_id in scan_ids:
+                    try:
+                        # Get scan data
+                        scan = ingestor.get_scan(scan_id)
+                        if not scan:
+                            logger.warning(f"⚠️ Scan {scan_id} not found, skipping")
+                            continue
+                        
+                        # Export scan
+                        result_buffer = export_manager.export_scan(scan_id, format_type)
+                        
+                        # Add to ZIP with proper filename
+                        filename = f"scan-{scan_id[:8]}-{scan.target.replace('/', '_')}.{format_type}"
+                        zip_file.writestr(filename, result_buffer.getvalue())
+                        
+                        exported_count += 1
+                        logger.info(f"✅ Exported scan {scan_id} ({exported_count}/{len(scan_ids)})")
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Failed to export {scan_id}: {str(e)}")
+                        # Continue with other scans
+                        continue
+            
+            if exported_count == 0:
+                scans_ns.abort(404, "No scans could be exported")
+            
+            logger.info(f"🎯 Bulk export complete: {exported_count}/{len(scan_ids)} scans exported")
+            
+            # Prepare ZIP for download
+            zip_buffer.seek(0)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f'bulk-export-{timestamp}.zip'
+            
+            return send_file(
+                zip_buffer,
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name=filename
+            )
+            
+        except BadRequest as e:
+            raise e
+        except Exception as e:
+            logger.error(f"Error in bulk export: {str(e)}")
+            scans_ns.abort(500, f"Bulk export failed: {str(e)}")
+
+
+def register_routes(api):
+    """
+    Register all API namespaces
+    
+    Args:
+        api: Flask-RESTX Api instance
+    """
+    api.add_namespace(scans_ns, path='/scans')
+    api.add_namespace(tools_ns, path='/tools')
+    api.add_namespace(stats_ns, path='/stats')

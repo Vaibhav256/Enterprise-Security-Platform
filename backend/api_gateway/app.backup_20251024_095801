@@ -1,0 +1,162 @@
+"""
+Flask Application Factory
+
+Creates and configures the Flask application with all routes, middleware,
+and extensions.
+
+Author: NTRO Security Team
+Date: 2025-10-22
+Updated: 2025-10-23 - Added WebSocket support (Phase 2, Day 1)
+"""
+
+# CRITICAL: eventlet.monkey_patch() MUST be called before importing anything else
+# This is required for WebSocket support with flask-socketio
+import eventlet
+eventlet.monkey_patch()
+
+import os
+from flask import Flask
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_cors import CORS
+from flask_restx import Api
+
+# Import configuration
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config.config import get_config
+
+
+def create_app(config_name: str = None) -> Flask:
+    """
+    Application factory function
+    
+    Args:
+        config_name: Configuration name (development, production, testing)
+        
+    Returns:
+        Configured Flask application instance
+    """
+    # Create Flask app
+    app = Flask(__name__)
+
+# Rate limiting
+limiter = Limiter(
+    app,
+    key_func=get_remote_address,
+    default_limits=["100 per hour", "20 per minute"]
+)
+    
+    # Load configuration
+    if config_name is None:
+        config_name = os.getenv('FLASK_ENV', 'development')
+    
+    config = get_config(config_name)
+    app.config.from_object(config)
+    
+    # Initialize CORS
+    CORS(app, origins=app.config.get('CORS_ORIGINS', ['http://localhost:3000']))
+    
+    # Initialize Flask-RESTX API
+    api = Api(
+        app,
+        version='1.0',
+        title='Vulnerability Detection Platform API',
+        description='REST API for managing security scans and vulnerability detection',
+        doc='/docs',
+        prefix='/api'
+    )
+    
+    # Register namespaces (blueprints)
+    from .routes import register_routes
+    register_routes(api)
+    
+    # Initialize WebSocket (Phase 2, Day 1)
+    from .websocket import init_socketio
+    socketio = init_socketio(app)
+    app.socketio = socketio  # Store reference for access in other modules
+    
+    # Health check endpoint (outside of /api prefix)
+    @app.route('/health', methods=['GET'])
+    def health_check():
+        """
+        Health check endpoint
+        
+        Returns:
+            dict: Health status and component availability
+        """
+        from redis import Redis
+        from sqlalchemy import create_engine
+        
+        health_status = {
+            'status': 'healthy',
+            'version': '1.0.0',
+            'components': {}
+        }
+        
+        # Check Redis
+        try:
+            redis_client = Redis(
+                host=app.config['REDIS_HOST'],
+                port=app.config['REDIS_PORT'],
+                decode_responses=True
+            )
+            redis_client.ping()
+            health_status['components']['redis'] = 'healthy'
+        except Exception as e:
+            health_status['components']['redis'] = f'unhealthy: {str(e)}'
+            health_status['status'] = 'degraded'
+        
+        # Check Database
+        try:
+            from sqlalchemy import text
+            engine = create_engine(app.config['DATABASE_URL'])
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            health_status['components']['database'] = 'healthy'
+        except Exception as e:
+            health_status['components']['database'] = f'unhealthy: {str(e)}'
+            health_status['status'] = 'degraded'
+        
+        # Check WSL
+        try:
+            from utils.wsl_helper import WSLHelper
+            wsl_distro = app.config.get('WSL_DISTRO', 'kali-linux')
+            wsl = WSLHelper(distribution=wsl_distro)
+            result = wsl.execute_command("echo 'test'")
+            if result.success:
+                health_status['components']['wsl'] = 'healthy'
+            else:
+                health_status['components']['wsl'] = 'unhealthy'
+                health_status['status'] = 'degraded'
+        except Exception as e:
+            health_status['components']['wsl'] = f'unhealthy: {str(e)}'
+            health_status['status'] = 'degraded'
+        
+        status_code = 200 if health_status['status'] == 'healthy' else 503
+        return health_status, status_code
+    
+    # Error handlers
+    @app.errorhandler(404)
+    def not_found(error):
+        return {'error': 'Resource not found'}, 404
+    
+    @app.errorhandler(500)
+    def internal_error(error):
+        return {'error': 'Internal server error'}, 500
+    
+    return app
+
+
+if __name__ == '__main__':
+    # Development server with WebSocket support (eventlet already patched at top)
+    app = create_app('development')
+    
+    # Use socketio.run() instead of app.run() for WebSocket support
+    app.socketio.run(
+        app,
+        host='0.0.0.0',
+        port=5000,
+        debug=True,
+        use_reloader=False  # Disable reloader to prevent issues with eventlet
+    )

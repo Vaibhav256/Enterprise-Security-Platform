@@ -1,0 +1,234 @@
+# =============================================================================
+# NTRO Vulnerability Scanner - Backend .gitignore
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# SECURITY - Environment Variables & Secrets
+# -----------------------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+.env.development
+.env.staging
+.env.production
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+.secrets
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+eval_venv/
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+test-results/
+coverage.json
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# -----------------------------------------------------------------------------
+# Database
+# -----------------------------------------------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+dump.rdb
+*.dump
+
+# PostgreSQL
+*.sql.gz
+postgresql-data/
+
+# -----------------------------------------------------------------------------
+# Logs
+# -----------------------------------------------------------------------------
+logs/
+*.log
+debug_logs/
+*.log.*
+
+# -----------------------------------------------------------------------------
+# Redis
+# -----------------------------------------------------------------------------
+dump.rdb
+redis-data/
+
+# -----------------------------------------------------------------------------
+# ChromaDB / Vector Database
+# -----------------------------------------------------------------------------
+chroma_db/
+*.chroma
+
+# -----------------------------------------------------------------------------
+# Reports & Exports
+# -----------------------------------------------------------------------------
+reports/
+test_exports/
+*.pdf
+*.html
+*.json
+!package.json
+!tsconfig.json
+!eslint_full_report.json
+
+# -----------------------------------------------------------------------------
+# IDE / Editor
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# -----------------------------------------------------------------------------
+# OS
+# -----------------------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.Spotlight-V100
+.Trashes
+
+# -----------------------------------------------------------------------------
+# Temporary files
+# -----------------------------------------------------------------------------
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+*.old
+
+# -----------------------------------------------------------------------------
+# Docker
+# -----------------------------------------------------------------------------
+docker-compose.override.yml
+
+# -----------------------------------------------------------------------------
+# Scan data & cache
+# -----------------------------------------------------------------------------
+scan_results/
+cache/
+.cache/
+
+# -----------------------------------------------------------------------------
+# Alembic migrations (keep migration files, ignore temp data)
+# -----------------------------------------------------------------------------
+# migrations/versions/*.pyc
+
+# -----------------------------------------------------------------------------
+# Testing
+# -----------------------------------------------------------------------------
+.pytest_cache/
+.testmondata
+
+# -----------------------------------------------------------------------------
+# Documentation
+# -----------------------------------------------------------------------------
+docs/_build/
+docs/build/
+
+# =============================================================================
+# IMPORTANT: Never commit sensitive data!
+# =============================================================================
+# - API keys, tokens, passwords
+# - SSL/TLS certificates
+# - Database dumps with real data
+# - Scan results containing sensitive info
+# - Configuration files with credentials
+# =============================================================================

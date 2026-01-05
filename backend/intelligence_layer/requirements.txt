@@ -19,7 +19,7 @@ pandas==2.2.0                     # Data manipulation
 
 # Visualization (for attack graph rendering)
 matplotlib==3.8.2                 # Static graph visualization
-plotly==5.18.0                    # Interactive graph visualization
+plotly==6.5.0                    # Interactive graph visualization
 
 # Performance Monitoring
 tqdm==4.66.1                      # Progress bars for indexing

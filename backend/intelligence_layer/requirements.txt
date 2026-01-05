@@ -7,7 +7,7 @@ networkx==3.2.1                   # Graph database for attack paths
 
 # LLM Interaction
 requests==2.31.0                  # HTTP client for Ollama API
-redis==5.0.1                      # Redis client for session persistence
+redis==7.1.0                      # Redis client for session persistence
 
 # NLP & Text Processing
 spacy==3.7.2                      # Named entity recognition

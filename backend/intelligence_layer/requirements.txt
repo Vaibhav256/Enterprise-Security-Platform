@@ -10,7 +10,7 @@ requests==2.31.0                  # HTTP client for Ollama API
 redis==5.0.1                      # Redis client for session persistence
 
 # NLP & Text Processing
-spacy==3.7.2                      # Named entity recognition
+spacy==3.8.11                      # Named entity recognition
 en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0-py3-none-any.whl  # spaCy English model
 
 # Data Handling

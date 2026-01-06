@@ -17,25 +17,116 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class ConfigValidator:
+    """Configuration validation utilities"""
+    
+    @staticmethod
+    def validate_database_url(url: str) -> None:
+        """Validate DATABASE_URL format"""
+        if not url:
+            raise ValueError("DATABASE_URL is required")
+        
+        if not url.startswith(('postgresql://', 'postgres://')):
+            raise ValueError("DATABASE_URL must use PostgreSQL (postgresql:// or postgres://)")
+        
+        # Parse URL to check components
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(url)
+            if not parsed.hostname:
+                raise ValueError("DATABASE_URL missing hostname")
+            if not parsed.username:
+                raise ValueError("DATABASE_URL missing username")
+        except Exception as e:
+            raise ValueError(f"Invalid DATABASE_URL format: {e}")
+    
+    @staticmethod
+    def validate_redis_config() -> None:
+        """Validate Redis configuration"""
+        host = os.getenv('REDIS_HOST')
+        port = os.getenv('REDIS_PORT', '6379')
+        
+        if not host:
+            raise ValueError("REDIS_HOST is required")
+        
+        try:
+            port_int = int(port)
+            if not (1 <= port_int <= 65535):
+                raise ValueError(f"REDIS_PORT out of range (1-65535): {port_int}")
+        except ValueError as e:
+            raise ValueError(f"Invalid REDIS_PORT: {e}")
+    
+    @staticmethod
+    def validate_secret_key(key: str, env: str) -> None:
+        """Validate SECRET_KEY strength"""
+        if env != 'production':
+            return  # Relaxed validation in non-production
+        
+        if not key:
+            raise ValueError("SECRET_KEY is required in production")
+        
+        if key == 'dev-secret-key-change-in-production':
+            raise ValueError(
+                "Production requires secure SECRET_KEY. "
+                "Generate with: python -c 'import secrets; print(secrets.token_hex(32))'"
+            )
+        
+        if len(key) < 32:
+            raise ValueError("SECRET_KEY must be at least 32 characters in production")
+    
+    @staticmethod
+    def validate_production_config() -> None:
+        """Validate production-specific requirements"""
+        env = os.getenv('FLASK_ENV', 'development')
+        
+        if env != 'production':
+            return
+        
+        required_vars = ['SECRET_KEY', 'DATABASE_URL', 'REDIS_HOST']
+        missing = [var for var in required_vars if not os.getenv(var)]
+        
+        if missing:
+            raise ValueError(f"Missing required production variables: {', '.join(missing)}")
+        
+        # Validate individual components
+        try:
+            ConfigValidator.validate_secret_key(os.getenv('SECRET_KEY', ''), env)
+            ConfigValidator.validate_database_url(os.getenv('DATABASE_URL', ''))
+            ConfigValidator.validate_redis_config()
+        except ValueError as e:
+            raise ValueError(f"Production configuration validation failed: {e}")
+
+
 def validate_required_env_vars():
-    """Validate that required environment variables are set for production"""
-    if os.getenv("FLASK_ENV") == "production":
-        required_vars = [
-            "SECRET_KEY",
-            "DATABASE_URL",
-            "REDIS_HOST",
-        ]
+    """Validate that required environment variables are set"""
+    env = os.getenv("FLASK_ENV", "development")
+    
+    try:
+        # Always validate basic configuration
+        if os.getenv("DATABASE_URL"):
+            ConfigValidator.validate_database_url(os.getenv("DATABASE_URL"))
         
-        missing_vars = [var for var in required_vars if not os.getenv(var)]
+        if os.getenv("REDIS_HOST"):
+            ConfigValidator.validate_redis_config()
         
-        if missing_vars:
-            print(f"ERROR: Missing required environment variables: {', '.join(missing_vars)}", file=sys.stderr)
-            print("Please set these variables before starting in production mode.", file=sys.stderr)
-            sys.exit(1)
-        
-        # Warn about default SECRET_KEY
-        if os.getenv("SECRET_KEY") == "dev-secret-key-change-in-production":
-            print("WARNING: Using default SECRET_KEY in production! This is insecure.", file=sys.stderr)
+        # Production-specific validation
+        if env == "production":
+            ConfigValidator.validate_production_config()
+            logger.info("✅ Production configuration validated successfully")
+        else:
+            logger.info(f"✅ Configuration validated for {env} environment")
+            
+    except ValueError as e:
+        logger.error(f"❌ Configuration validation failed: {e}")
+        if env == "production":
+            sys.exit(1)  # Fail fast in production
+        else:
+            logger.warning("⚠️  Continuing in development mode with validation errors...")
 
 
 # Validate on import
@@ -55,7 +146,7 @@ class Config:
 
     # API
     API_PORT = int(os.getenv("API_PORT", "5000"))
-    API_HOST = os.getenv("API_HOST", "0.0.0.0")
+    API_HOST = os.getenv("API_HOST", "127.0.0.1")  # default to localhost to avoid binding all interfaces
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
     API_KEY = os.getenv("API_KEY", "")
 

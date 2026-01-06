@@ -36,7 +36,7 @@ const ScanForm = () => {
     // Nikto options
     port: 80,
     ssl: false,
-    timeout: 600,
+    // No timeout - backend uses dynamic timeouts (6h for full, 3h for comprehensive, 1.5h for basic)
     tuning: '1234567890ab',
     evasion: '',
     // Nuclei options

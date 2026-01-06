@@ -24,8 +24,9 @@ export default defineConfig({
     },
   },
   build: {
-    // Enable minification
+    // Enable minification with production optimizations
     minify: 'esbuild',
+    
     // Optimize chunk strategy
     rollupOptions: {
       output: {
@@ -54,8 +55,12 @@ export default defineConfig({
     chunkSizeWarningLimit: 800,
     // Enable CSS code splitting
     cssCodeSplit: true,
-    // Source maps for better debugging (disable in production)
-    sourcemap: false,
+    
+    // Source maps: enable in dev, disable in production
+    sourcemap: process.env.NODE_ENV === 'development',
+    
+    // Generate manifest for production tracking
+    manifest: true,
   },
   // Optimize dependencies
   optimizeDeps: {

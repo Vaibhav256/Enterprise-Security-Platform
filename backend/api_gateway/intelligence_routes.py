@@ -3,6 +3,14 @@ Intelligence Layer API Routes
 REST API endpoints for RAG chatbot.
 """
 
+# Configuration constants (Issue Q3 - Magic numbers extracted, Issue P6 - Timeout)
+CHAT_QUERY_MAX_LENGTH = 2000  # Maximum characters for AI chat queries
+CHAT_SESSION_ID_MAX_LENGTH = 100  # Maximum session ID length
+CHAT_TOP_K_MIN = 1  # Minimum retrieval results
+CHAT_TOP_K_MAX = 20  # Maximum retrieval results
+CHAT_TOP_K_DEFAULT = 5  # Default retrieval results
+CHAT_REQUEST_TIMEOUT = 120  # Seconds - Long timeout for LLM inference
+
 import logging
 import os
 from datetime import datetime
@@ -390,9 +398,12 @@ class ChatEndpoint(Resource):
         - CISA KEV lookups: 1-2s
         - Full pipeline: 4-10s typical, up to 60s with slower networks
         
-        Client timeout should be set to 120+ seconds.
+        Client timeout should be set to {CHAT_REQUEST_TIMEOUT}+ seconds.
+        Server-side timeout: {CHAT_REQUEST_TIMEOUT}s (configurable via CHAT_REQUEST_TIMEOUT constant)
         """
         try:
+            from utils.validation import sanitize_search_query, validate_positive_integer
+            
             # Parse request
             data = request.get_json()
             if not data:
@@ -410,20 +421,35 @@ class ChatEndpoint(Resource):
             if not query:
                 return {'error': 'query cannot be empty'}, 400
             
-            if len(query) > 5000:
-                return {'error': 'query cannot exceed 5000 characters'}, 400
+            # Validate query length (max 2000 chars for AI queries)
+            if len(query) > CHAT_QUERY_MAX_LENGTH:
+                return {'error': f'query cannot exceed {CHAT_QUERY_MAX_LENGTH} characters'}, 400
+            
+            # Sanitize query to prevent XSS and prompt injection
+            try:
+                query = sanitize_search_query(query)
+            except ValueError as e:
+                return {'error': f'Invalid query: {str(e)}'}, 400
             
             # Validate optional fields
             session_id = data.get('session_id')
-            if session_id is not None and not isinstance(session_id, str):
-                return {'error': 'session_id must be a string'}, 400
+            if session_id is not None:
+                if not isinstance(session_id, str):
+                    return {'error': 'session_id must be a string'}, 400
+                # Validate session_id format (alphanumeric + hyphens only)
+                if not all(c.isalnum() or c in '-_' for c in session_id):
+                    return {'error': 'session_id contains invalid characters'}, 400
+                if len(session_id) > CHAT_SESSION_ID_MAX_LENGTH:
+                    return {'error': f'session_id too long (max {CHAT_SESSION_ID_MAX_LENGTH} chars)'}, 400
             
-            top_k = data.get('top_k', 5)
+            top_k = data.get('top_k', CHAT_TOP_K_DEFAULT)
             if not isinstance(top_k, int):
                 return {'error': 'top_k must be an integer'}, 400
             
-            if not 1 <= top_k <= 20:
-                return {'error': 'top_k must be between 1 and 20'}, 400
+            try:
+                top_k = validate_positive_integer(top_k, 'top_k', min_value=CHAT_TOP_K_MIN, max_value=CHAT_TOP_K_MAX)
+            except ValueError as e:
+                return {'error': str(e)}, 400
             
             # Log query
             logger.info(f"Chat query: {query[:50]}...")

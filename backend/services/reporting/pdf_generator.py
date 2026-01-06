@@ -529,31 +529,38 @@ class PDFReportGenerator:
         """Create top CVEs bar chart using matplotlib"""
         # Create matplotlib figure
         fig, ax = plt.subplots(figsize=(8, 4))
-
-        # Extract CVE IDs and scores
-        cve_ids = [cve.get("cve_id", "Unknown")[:15] for cve in cves[:10]]  # Truncate long IDs
-        scores = [float(cve.get("cvss_score", 0)) for cve in cves[:10]]
+        buf = None
         
-        colors_list = [
-            "#dc2626" if s >= 9.0 else "#f97316" if s >= 7.0 else "#f59e0b"
-            for s in scores
-        ]
+        try:
+            # Extract CVE IDs and scores
+            cve_ids = [cve.get("cve_id", "Unknown")[:15] for cve in cves[:10]]  # Truncate long IDs
+            scores = [float(cve.get("cvss_score", 0)) for cve in cves[:10]]
+            
+            colors_list = [
+                "#dc2626" if s >= 9.0 else "#f97316" if s >= 7.0 else "#f59e0b"
+                for s in scores
+            ]
 
-        ax.barh(cve_ids, scores, color=colors_list)
-        ax.set_xlabel("CVSS Score")
-        ax.set_title("Top 10 CVEs by Severity")
-        ax.set_xlim(0, 10)
+            ax.barh(cve_ids, scores, color=colors_list)
+            ax.set_xlabel("CVSS Score")
+            ax.set_title("Top 10 CVEs by Severity")
+            ax.set_xlim(0, 10)
 
-        # Save to BytesIO
-        buf = BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=100)
-        plt.close(fig)
-        buf.seek(0)
+            # Save to BytesIO
+            buf = BytesIO()
+            plt.tight_layout()
+            plt.savefig(buf, format="png", dpi=100)
+            buf.seek(0)
 
-        # Convert to ReportLab Image
-        img = RLImage(buf, width=6 * inch, height=3 * inch)
-        return img
+            # Convert to ReportLab Image
+            img = RLImage(buf, width=6 * inch, height=3 * inch)
+            return img
+        finally:
+            # Always close matplotlib figure to prevent memory leaks
+            plt.close(fig)
+            # Close BytesIO buffer if it was created
+            if buf is not None:
+                buf.close()
 
     def _build_findings_section(self, scan_data: Dict[str, Any]) -> List:
         """Build detailed findings section"""

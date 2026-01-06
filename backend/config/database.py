@@ -8,13 +8,41 @@ Date: 2025-10-26
 """
 
 import os
+import logging
 from typing import Optional
 
 from dotenv import load_dotenv
 from psycopg2 import pool
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.ext.declarative import declarative_base
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# SQLAlchemy setup for ORM queries
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres@localhost:5432/vulnerability_scanner",
+)
+
+# Create SQLAlchemy engine
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=10,
+    max_overflow=20,
+    pool_pre_ping=True,
+    echo=False
+)
+
+# Create SessionLocal for dependency injection
+SessionLocal = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
+
+# Base class for ORM models
+Base = declarative_base()
 
 
 class DatabaseConfig:
@@ -26,17 +54,13 @@ class DatabaseConfig:
     def get_connection_pool(cls):
         """Get or create connection pool"""
         if cls._connection_pool is None:
-            database_url = os.getenv(
-                "DATABASE_URL",
-                "postgresql://postgres:postgres@localhost:5432/vulnerability_scanner",
-            )
-
             try:
                 cls._connection_pool = pool.SimpleConnectionPool(
-                    minconn=1, maxconn=10, dsn=database_url
+                    minconn=1, maxconn=10, dsn=DATABASE_URL
                 )
+                logger.info("✅ Database connection pool created successfully")
             except Exception as e:
-                print(f"Error creating connection pool: {e}")
+                logger.error(f"❌ Error creating connection pool: {e}")
                 raise
 
         return cls._connection_pool
@@ -61,7 +85,7 @@ def get_db_connection():
         conn = pool.getconn()
         return conn
     except Exception as e:
-        print(f"Error getting database connection: {e}")
+        logger.error(f"Error getting database connection: {e}")
         raise
 
 
@@ -76,7 +100,7 @@ def release_db_connection(conn):
         pool = DatabaseConfig.get_connection_pool()
         pool.putconn(conn)
     except Exception as e:
-        print(f"Error releasing database connection: {e}")
+        logger.error(f"Error releasing database connection: {e}")
 
 
 def test_connection() -> bool:
@@ -95,7 +119,7 @@ def test_connection() -> bool:
         release_db_connection(conn)
         return bool(result and result[0] == 1)
     except Exception as e:
-        print(f"Database connection test failed: {e}")
+        logger.error(f"Database connection test failed: {e}")
         return False
 
 
@@ -115,7 +139,7 @@ def get_db_version() -> Optional[str]:
         release_db_connection(conn)
         return str(version[0]) if version else None
     except Exception as e:
-        print(f"Error getting database version: {e}")
+        logger.error(f"Error getting database version: {e}")
         return None
 
 
@@ -269,12 +293,12 @@ def init_database():
 
         conn.commit()
         cursor.close()
-        print("Database schema initialized successfully")
+        logger.info("✅ Database schema initialized successfully")
 
     except Exception as e:
         if conn:
             conn.rollback()
-        print(f"Error initializing database: {e}")
+        logger.error(f"❌ Error initializing database: {e}")
         raise
     finally:
         if conn:
@@ -287,4 +311,4 @@ if os.getenv("DATABASE_URL"):
         if test_connection():
             init_database()
     except Exception as e:
-        print(f"Warning: Could not initialize database: {e}")
+        logger.warning(f"⚠️  Could not initialize database: {e}")

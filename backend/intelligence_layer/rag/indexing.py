@@ -517,7 +517,8 @@ RISK IMPACT: {'CRITICAL - This vulnerability poses an immediate threat to system
         """Generate unique document ID from CVE, host, and port"""
         # Use hash to ensure uniqueness
         content = f"{cve_id}_{host_ip}_{port or 0}"
-        hash_suffix = hashlib.md5(content.encode()).hexdigest()[:8]
+        # Use a secure hash (SHA-256) for document ID generation to avoid weak-hash flags
+        hash_suffix = hashlib.sha256(content.encode()).hexdigest()[:12]
         return f"vuln_{hash_suffix}"
     
     def query_vulnerabilities(

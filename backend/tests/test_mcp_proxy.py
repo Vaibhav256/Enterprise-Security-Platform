@@ -191,7 +191,7 @@ def test_mcp_status_endpoint():
         import requests
         
         print("\n1. Calling GET /api/intelligence/mcp-status...")
-        response = requests.get("http://localhost:8000/api/intelligence/mcp-status")
+        response = requests.get("http://localhost:8000/api/intelligence/mcp-status", timeout=5)
         
         if response.status_code == 200:
             data = response.json()

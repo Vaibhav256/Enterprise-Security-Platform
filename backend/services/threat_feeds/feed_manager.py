@@ -198,7 +198,8 @@ class ThreatFeedManager:
             last_dt = datetime.fromisoformat(last_update)
             age = datetime.utcnow() - last_dt
             return age > self.cache_ttl
-        except:
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Failed to parse last_update timestamp: {e}")
             return True
     
     def _get_last_update(self) -> Optional[str]:
@@ -212,7 +213,8 @@ class ThreatFeedManager:
             with open(status_file, 'r') as f:
                 status = json.load(f)
                 return status.get('last_update')
-        except:
+        except (IOError, json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Failed to read status file: {e}")
             return None
     
     def _update_last_refresh(self):
@@ -249,7 +251,8 @@ class ThreatFeedManager:
                 'size': stat.st_size,
                 'valid': age < self.cache_ttl
             }
-        except:
+        except (OSError, IOError, ValueError) as e:
+            logger.debug(f"Failed to get cache info: {e}")
             return {
                 'cached': False,
                 'age': None,

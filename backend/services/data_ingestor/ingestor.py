@@ -13,14 +13,25 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+from sqlalchemy.orm import Session, sessionmaker, selectinload
+from sqlalchemy.orm.strategy_options import _AbstractLoad
 
 from .models import Base, RawScanResult, Scan, ScanStatus, ScanSummary
 from config.models import Vulnerability
 import uuid
 
 logger = logging.getLogger(__name__)
+
+# Valid status transitions for state machine validation (Issue 6.3)
+VALID_TRANSITIONS = {
+    ScanStatus.PENDING: [ScanStatus.QUEUED, ScanStatus.CANCELLED],
+    ScanStatus.QUEUED: [ScanStatus.RUNNING, ScanStatus.CANCELLED],
+    ScanStatus.RUNNING: [ScanStatus.COMPLETED, ScanStatus.FAILED, ScanStatus.CANCELLED],
+    ScanStatus.COMPLETED: [],  # Terminal state
+    ScanStatus.FAILED: [ScanStatus.PENDING],  # Allow retry by resetting to PENDING
+    ScanStatus.CANCELLED: []  # Terminal state
+}
 
 
 class DataIngestor:
@@ -113,6 +124,10 @@ class DataIngestor:
             logger.info("Created scan record: %s", scan_id)
             return scan
 
+        except IntegrityError as e:
+            session.rollback()
+            logger.error("Duplicate scan ID detected: %s", scan_id)
+            raise ValueError(f"Scan with ID {scan_id} already exists. Please use a unique scan ID.")
         except SQLAlchemyError as e:
             session.rollback()
             logger.error("Failed to create scan: %s", str(e))
@@ -166,6 +181,24 @@ class DataIngestor:
                 logger.warning("Scan not found: %s", scan_id)
                 return False
 
+            # Validate status transition (Issue 6.3)
+            current_status = scan.status
+            valid_next_states = VALID_TRANSITIONS.get(current_status, [])
+            
+            if status != current_status and status not in valid_next_states:
+                logger.error(
+                    "Invalid status transition for scan %s: %s -> %s (valid: %s)",
+                    scan_id, current_status.value, status.value,
+                    [s.value for s in valid_next_states]
+                )
+                raise ValueError(
+                    f"Invalid status transition: {current_status.value} -> {status.value}. "
+                    f"Valid transitions: {[s.value for s in valid_next_states]}"
+                )
+            
+            logger.info("Status transition validated: %s -> %s for scan %s", 
+                       current_status.value, status.value, scan_id)
+
             scan.status = status
 
             if progress is not None:
@@ -196,6 +229,47 @@ class DataIngestor:
         finally:
             session.close()
 
+    def update_scan_progress(
+        self,
+        scan_id: str,
+        progress: int,
+        message: Optional[str] = None,
+    ) -> bool:
+        """
+        Update scan progress for real-time updates
+
+        Args:
+            scan_id: Scan ID
+            progress: Progress percentage (0-100)
+            message: Optional progress message
+
+        Returns:
+            True if updated successfully
+        """
+        session = self.get_session()
+
+        try:
+            scan = session.query(Scan).filter(Scan.id == scan_id).first()
+
+            if not scan:
+                logger.warning("Scan not found: %s", scan_id)
+                return False
+
+            scan.progress_percent = progress
+            if message:
+                scan.progress_message = message
+
+            session.commit()
+            logger.debug("Updated scan %s progress to %d%%", scan_id, progress)
+            return True
+
+        except SQLAlchemyError as e:
+            session.rollback()
+            logger.error("Failed to update scan progress: %s", str(e))
+            return False
+        finally:
+            session.close()
+
     def list_scans(
         self,
         status: Optional[ScanStatus] = None,
@@ -222,7 +296,11 @@ class DataIngestor:
         session = self.get_session()
 
         try:
-            query = session.query(Scan)
+            # Eager load relationships to prevent N+1 queries (Issue P1)
+            query = session.query(Scan).options(
+                selectinload(Scan.raw_results),
+                selectinload(Scan.summary)
+            )
 
             # Apply filters
             if status:
@@ -557,7 +635,16 @@ class DataIngestor:
         try:
             from config.models import Vulnerability
             
+            # Query vulnerabilities (no artificial limit - scans need all vulns)
             vulnerabilities = session.query(Vulnerability).filter_by(scan_id=scan_id).all()
+            
+            # Safety check: Warn if result set is very large
+            if len(vulnerabilities) > 5000:
+                logger.warning(
+                    "Large vulnerability result set for scan %s: %d vulnerabilities. "
+                    "Consider implementing pagination for this endpoint.",
+                    scan_id, len(vulnerabilities)
+                )
             
             result = []
             for vuln in vulnerabilities:

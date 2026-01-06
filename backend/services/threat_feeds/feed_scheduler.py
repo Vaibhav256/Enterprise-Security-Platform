@@ -18,6 +18,13 @@ from .feed_sync_service import FeedSyncService
 
 logger = logging.getLogger(__name__)
 
+# Configuration constants (Issue Q3 - Magic numbers extracted)
+SYNC_INTERVAL_HOURS = 2  # Sync feeds every 2 hours
+MISFIRE_GRACE_TIME_SECONDS = 300  # Allow 5 minute delay if scheduler is busy
+STARTUP_MISFIRE_GRACE_TIME_SECONDS = 60  # Allow 1 minute delay for startup sync
+MAX_CRITICAL_CVE_ALERTS = 5  # Limit critical alerts to avoid log spam
+CRITICAL_ALERT_LOOKBACK_DAYS = 7  # Check for critical CVEs in last 7 days
+
 
 class FeedScheduler:
     """Manages scheduled feed synchronization"""
@@ -50,13 +57,13 @@ class FeedScheduler:
             return
         
         try:
-            # Add job: sync threat feeds every 2 hours (increased frequency)
+            # Add job: sync threat feeds every N hours (configurable)
             self._job_id = self.scheduler.add_job(
                 func=self._sync_feeds_job,
-                trigger=IntervalTrigger(hours=2),
+                trigger=IntervalTrigger(hours=SYNC_INTERVAL_HOURS),
                 id='feed_sync_2h',
                 name='Threat Feed Synchronization',
-                misfire_grace_time=300,  # Allow 5 min delay
+                misfire_grace_time=MISFIRE_GRACE_TIME_SECONDS,
                 replace_existing=True
             )
             
@@ -65,7 +72,7 @@ class FeedScheduler:
                 func=self._sync_feeds_job,
                 id='feed_sync_startup',
                 name='Initial Feed Sync',
-                misfire_grace_time=60,
+                misfire_grace_time=STARTUP_MISFIRE_GRACE_TIME_SECONDS,
                 replace_existing=True
             )
             
@@ -158,12 +165,13 @@ class FeedScheduler:
             from services.data_ingestor.models import FeedEntry
             
             # Find critical CVEs with exploits
-            week_ago = datetime.utcnow() - timedelta(days=7)
+            # Show top N critical vulnerabilities from last N days (configurable)
+            week_ago = datetime.utcnow() - timedelta(days=CRITICAL_ALERT_LOOKBACK_DAYS)
             critical_cves = session.query(FeedEntry).filter(
                 FeedEntry.feed_source == 'nvd',
                 FeedEntry.severity == 'CRITICAL',
                 FeedEntry.published_date >= week_ago
-            ).order_by(FeedEntry.cvss_score.desc()).limit(5).all()
+            ).order_by(FeedEntry.cvss_score.desc()).limit(MAX_CRITICAL_CVE_ALERTS).all()
             
             if critical_cves:
                 logger.warning("⚠️  CRITICAL VULNERABILITIES DETECTED:")

@@ -236,7 +236,8 @@ class FeedScheduler:
                                 needs_refresh = True
                                 logger.info(f"Feed {feed_name} cache expired ({hours}h old) - refresh needed")
                                 break
-                    except:
+                    except (KeyError, ValueError, TypeError) as e:
+                        logger.debug(f"Failed to parse cache info: {e}")
                         pass
             
             # Trigger refresh if needed

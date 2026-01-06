@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from collections import defaultdict
 import json
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +22,12 @@ class MCPWebProxy:
     """
     Secure web proxy for LLM with safeguards:
     - Whitelisted domains only
-    - Rate limiting per domain
+    - Rate limiting per domain (thread-safe)
     - SSRF protection (no private IPs)
     - Response size limits
     - Timeout enforcement
+    
+    Thread Safety: All shared state access protected with locks
     """
     
     # Whitelisted domains (only these can be accessed)
@@ -81,8 +84,10 @@ class MCPWebProxy:
         
         # Rate limiting tracker: {domain: [(timestamp1, timestamp2, ...)]}
         self.request_history: Dict[str, List[datetime]] = defaultdict(list)
+        # Thread-safe access to request_history
+        self._history_lock = threading.Lock()
         
-        logger.info("✅ MCP Web Proxy initialized")
+        logger.info("✅ MCP Web Proxy initialized (thread-safe)")
     
     def fetch(
         self,
@@ -243,22 +248,39 @@ class MCPWebProxy:
             return {'valid': False, 'error': f'URL parsing error: {e}'}
     
     def _check_rate_limit(self, domain: str) -> bool:
-        """Check if request is within rate limit"""
+        """
+        Check if request is within rate limit (thread-safe)
+        
+        Thread Safety: Uses lock to safely access and modify request_history
+        """
         now = datetime.now()
         one_minute_ago = now - timedelta(minutes=1)
         
-        # Clean old requests
-        self.request_history[domain] = [
-            ts for ts in self.request_history[domain]
-            if ts > one_minute_ago
-        ]
-        
-        # Check if under limit
-        return len(self.request_history[domain]) < self.max_requests_per_minute
+        with self._history_lock:
+            # Clean old requests
+            self.request_history[domain] = [
+                ts for ts in self.request_history[domain]
+                if ts > one_minute_ago
+            ]
+            
+            # Check if under limit
+            if len(self.request_history[domain]) >= self.max_requests_per_minute:
+                logger.warning(
+                    f"Rate limit exceeded for {domain}: "
+                    f"{len(self.request_history[domain])}/{self.max_requests_per_minute}"
+                )
+                return False
+            
+            return True
     
     def _record_request(self, domain: str):
-        """Record request timestamp for rate limiting"""
-        self.request_history[domain].append(datetime.now())
+        """
+        Record request timestamp for rate limiting (thread-safe)
+        
+        Thread Safety: Uses lock to safely append to request_history
+        """
+        with self._history_lock:
+            self.request_history[domain].append(datetime.now())
     
     def fetch_cve_details(self, cve_id: str) -> Dict[str, Any]:
         """

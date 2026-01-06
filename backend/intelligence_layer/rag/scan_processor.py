@@ -133,7 +133,8 @@ class ScanParser:
         if isinstance(data, str):
             try:
                 data = json.loads(data)
-            except:
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.debug(f"Failed to parse data as JSON: {e}")
                 return ScanFormatType.UNKNOWN
         
         if not isinstance(data, dict):
@@ -505,8 +506,8 @@ class ScanParser:
             if isinstance(data, str):
                 try:
                     data = json.loads(data)
-                except:
-                    logger.error("Failed to parse input as JSON")
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.error(f"Failed to parse input as JSON: {e}")
                     return None
             
             # Detect format

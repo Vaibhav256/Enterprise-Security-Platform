@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Optional
 import os
 
-from sqlalchemy import JSON, Column, DateTime, Enum as SQLEnum, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import JSON, Column, DateTime, Enum as SQLEnum, ForeignKey, Index, Integer, String, Text, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 
@@ -68,6 +68,10 @@ class Scan(Base):
     # Job tracking
     job_id = Column(String(100), nullable=True, index=True)
     
+    # Progress tracking (for real-time updates)
+    progress_percent = Column(Integer, default=0, nullable=True)
+    progress_message = Column(String(500), nullable=True)
+    
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     queued_at = Column(DateTime, nullable=True)
@@ -80,10 +84,23 @@ class Scan(Base):
     # Relationships
     raw_results = relationship("RawScanResult", back_populates="scan", cascade="all, delete-orphan")
     summary = relationship("ScanSummary", back_populates="scan", uselist=False, cascade="all, delete-orphan")
+    
+    # Performance indexes for frequently queried columns (Issue P2)
+    __table_args__ = (
+        Index('idx_scan_status', 'status'),
+        Index('idx_scan_tool_name', 'tool_name'),
+        Index('idx_scan_created_at', 'created_at'),
+        Index('idx_scan_target', 'target'),
+    )
 
     @property
     def progress(self) -> int:
         """Calculate scan progress percentage"""
+        # Use stored progress if available
+        if self.progress_percent is not None:
+            return self.progress_percent
+        
+        # Fallback to status-based progress
         if self.status == ScanStatus.COMPLETED:
             return 100
         elif self.status == ScanStatus.FAILED or self.status == ScanStatus.CANCELLED:
@@ -109,9 +126,10 @@ class Scan(Base):
             'scan_type': self.scan_type,
             'status': self.status.value if isinstance(self.status, Enum) else self.status,
             'progress': self.progress,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
-            'started_at': self.started_at.isoformat() if self.started_at else None,
-            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'progress_message': self.progress_message,
+            'created_at': self.created_at.isoformat() + 'Z' if self.created_at else None,
+            'started_at': self.started_at.isoformat() + 'Z' if self.started_at else None,
+            'completed_at': self.completed_at.isoformat() + 'Z' if self.completed_at else None,
             'execution_time': self.execution_time,
             'error_message': self.error_message,
             'options': self.options

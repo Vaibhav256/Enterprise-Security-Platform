@@ -6,6 +6,7 @@ Provides access to live security data feeds (NVD, ExploitDB, CWE, etc.)
 import requests
 import logging
 import time
+import threading
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 import json
@@ -15,33 +16,37 @@ logger = logging.getLogger(__name__)
 
 
 class SimpleCache:
-    """Simple in-memory cache with TTL"""
+    """Simple in-memory cache with TTL and thread safety"""
     
     def __init__(self, ttl_seconds=3600):
         self.cache = {}
         self.ttl = ttl_seconds
         self.timestamps = {}
+        self._lock = threading.Lock()  # Thread safety
     
     def get(self, key: str) -> Optional[Any]:
-        if key not in self.cache:
-            return None
-        
-        # Check if expired
-        timestamp = self.timestamps.get(key)
-        if timestamp and (datetime.utcnow() - timestamp).seconds > self.ttl:
-            del self.cache[key]
-            del self.timestamps[key]
-            return None
-        
-        return self.cache[key]
+        with self._lock:
+            if key not in self.cache:
+                return None
+            
+            # Check if expired
+            timestamp = self.timestamps.get(key)
+            if timestamp and (datetime.utcnow() - timestamp).seconds > self.ttl:
+                del self.cache[key]
+                del self.timestamps[key]
+                return None
+            
+            return self.cache[key]
     
     def set(self, key: str, value: Any):
-        self.cache[key] = value
-        self.timestamps[key] = datetime.utcnow()
+        with self._lock:
+            self.cache[key] = value
+            self.timestamps[key] = datetime.utcnow()
     
     def clear(self):
-        self.cache.clear()
-        self.timestamps.clear()
+        with self._lock:
+            self.cache.clear()
+            self.timestamps.clear()
 
 
 class NVDClient:
@@ -428,25 +433,37 @@ class ExploitDBClient:
         Returns:
             List of exploits for this CVE
         """
-        if not self.api_key:
-            logger.warning("ExploitDB API key not configured - skipping exploit search")
-            return []
-        
         try:
             # Check cache
-            cached = self.cache.get(f"exploit_{cve_id}")
+            cache_key = f"exploit_{cve_id}"
+            cached = self.cache.get(cache_key)
             if cached:
+                logger.debug(f"ExploitDB cache hit for {cve_id}")
                 return cached
             
-            # Search ExploitDB
-            # Note: This is a simplified example - actual implementation
-            # would need to handle ExploitDB API rate limits and authentication
+            # Search ExploitDB by CVE (uses public CSV feed - no API key needed)
+            from services.threat_feeds.exploitdb_client import ExploitDBClient
             
-            logger.info(f"ExploitDB search not implemented yet (requires API key)")
+            client = ExploitDBClient(api_key=self.api_key)
+            exploits = client.search_exploits(cve_id=cve_id)
+            
+            # Cache results (24 hour TTL)
+            if exploits:
+                self.cache.set(cache_key, exploits)
+                logger.info(f"Found {len(exploits)} exploits for {cve_id}")
+            else:
+                logger.debug(f"No exploits found for {cve_id}")
+            
+            return exploits
+            
+        except Exception as e:
+            logger.error(f"Error searching ExploitDB for {cve_id}: {e}")
             return []
+            
+            return exploits
         
         except Exception as e:
-            logger.error(f"Error searching ExploitDB: {e}")
+            logger.error(f"Error searching ExploitDB for {cve_id}: {e}")
             return []
 
 
@@ -473,14 +490,56 @@ class CWEClient:
             # Check cache
             cached = self.cache.get(f"cwe_{cwe_id}")
             if cached:
+                logger.debug(f"CWE cache hit for {cwe_id}")
                 return cached
             
-            # In production, would fetch from:
-            # https://cwe.mitre.org/data/csv/2000.csv or similar
+            # Fetch from MITRE CWE database
+            # CSV format: CWE-ID,Name,Weakness Abstraction,Status,Description,Extended Description...
+            cwe_url = "https://cwe.mitre.org/data/csv/2000.csv"
             
-            # For now, return basic info
-            logger.warning("CWE lookup not fully implemented yet")
-            return None
+            try:
+                import requests
+                import csv
+                from io import StringIO
+                
+                # Download CWE CSV (cached for 24 hours)
+                response = requests.get(cwe_url, timeout=30)
+                response.raise_for_status()
+                
+                # Parse CSV with proper newline handling
+                csv_data = StringIO(response.text, newline='')
+                reader = csv.DictReader(csv_data)
+                
+                # Find matching CWE
+                cwe_id_clean = cwe_id.upper().replace('CWE-', '')
+                
+                for row in reader:
+                    if row.get('CWE-ID') == cwe_id_clean:
+                        result = {
+                            'cwe_id': f"CWE-{cwe_id_clean}",
+                            'name': row.get('Name', 'Unknown'),
+                            'abstraction': row.get('Weakness Abstraction', 'Unknown'),
+                            'status': row.get('Status', 'Unknown'),
+                            'description': row.get('Description', 'No description available'),
+                            'extended_description': row.get('Extended Description', ''),
+                            'url': f"https://cwe.mitre.org/data/definitions/{cwe_id_clean}.html",
+                            'source': 'MITRE CWE'
+                        }
+                        
+                        # Cache for 24 hours
+                        self.cache.set(f"cwe_{cwe_id}", result)
+                        logger.info(f"Fetched CWE details for {cwe_id}: {result['name']}")
+                        return result
+                
+                logger.warning(f"CWE {cwe_id} not found in database")
+                return None
+                
+            except requests.RequestException as e:
+                logger.error(f"Failed to download CWE database: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Error parsing CWE data for {cwe_id}: {e}")
+                return None
         
         except Exception as e:
             logger.error(f"Error fetching CWE details: {e}")
@@ -492,9 +551,16 @@ class RealTimeSourceManager:
     Manager for all real-time data sources
     """
     
-    def __init__(self, nvd_api_key: Optional[str] = None):
+    def __init__(self, nvd_api_key: Optional[str] = None, exploitdb_api_key: Optional[str] = None):
+        """
+        Initialize real-time source manager.
+        
+        Args:
+            nvd_api_key: Optional NVD API key (recommended for higher rate limits)
+            exploitdb_api_key: Optional ExploitDB API key (currently not required, reserved for future use)
+        """
         self.nvd = NVDClient(api_key=nvd_api_key)
-        self.exploitdb = ExploitDBClient(api_key=None)  # TODO: Add from config
+        self.exploitdb = ExploitDBClient(api_key=exploitdb_api_key)
         self.cwe = CWEClient()
     
     def enrich_cve(self, cve_id: str) -> Optional[Dict[str, Any]]:
@@ -523,7 +589,7 @@ class RealTimeSourceManager:
                 result['confidence'] = 0.3  # Lower confidence if NVD not available
             
             # Fetch from ExploitDB
-            exploits = self.exploitdb.search_by_cve(cve_id)
+            exploits = self.exploitdb.search_exploits(cve_id=cve_id)
             if exploits:
                 result['sources']['exploits'] = exploits
                 result['confidence'] += 0.05

@@ -762,7 +762,14 @@ class XMLExporter(BaseExporter):
     def export(self, scan_data: Dict[str, Any], output: BinaryIO):
         """Export scan data as XML"""
         import xml.etree.ElementTree as ET
-        from xml.dom import minidom
+        # Use defusedxml to harden XML handling if available
+try:
+    from defusedxml import defuse_stdlib
+    defuse_stdlib()
+except Exception:
+    pass
+
+from xml.dom import minidom
 
         try:
             # Create root element
@@ -812,9 +819,16 @@ class XMLExporter(BaseExporter):
                                 else str(value)
                             )
 
-            # Pretty print XML
+            # Pretty print XML using defusedxml's minidom when available
             xml_str = ET.tostring(root, encoding="utf-8")
-            dom = minidom.parseString(xml_str)
+            try:
+                # Prefer defusedxml.minidom to avoid XML attacks
+                from defusedxml import minidom as safe_minidom
+                dom = safe_minidom.parseString(xml_str)
+            except Exception:
+                from xml.dom import minidom as std_minidom
+                dom = std_minidom.parseString(xml_str)
+
             pretty_xml = dom.toprettyxml(indent="  ", encoding="utf-8")
 
             output.write(pretty_xml)

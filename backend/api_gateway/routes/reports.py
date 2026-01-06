@@ -10,11 +10,18 @@ import os
 import uuid
 from datetime import datetime
 from typing import Dict, Any
+from contextlib import contextmanager
 
 from services.reporting.pdf_generator import generate_pdf_report
 from services.reporting.excel_generator import generate_excel_report
 from config.database import get_db_connection, release_db_connection
 from utils.validators import validate_scan_id
+from utils.validation import (
+    validate_report_organization,
+    validate_report_classification,
+    validate_report_options,
+    validate_scan_id as validate_scan_id_format
+)
 
 # Create blueprint
 reports_bp = Blueprint('reports', __name__, url_prefix='/api/reports')
@@ -52,11 +59,23 @@ def generate_pdf():
         if not data or 'scan_id' not in data:
             return jsonify({'error': 'scan_id is required'}), 400
         
-        scan_id = data['scan_id']
+        # Validate scan_id format
+        try:
+            scan_id = validate_scan_id_format(data['scan_id'])
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
         
         # Validate scan exists
         if not validate_scan_id(scan_id):
             return jsonify({'error': f'Scan {scan_id} not found'}), 404
+        
+        # Validate and sanitize options
+        try:
+            validated_options = validate_report_options(data)
+            organization = validate_report_organization(data.get('organization'))
+            classification = validate_report_classification(data.get('classification'))
+        except ValueError as e:
+            return jsonify({'error': f'Invalid options: {str(e)}'}), 400
         
         # Get scan data from database
         scan_data = _get_scan_report_data(scan_id)
@@ -74,8 +93,8 @@ def generate_pdf():
         generate_pdf_report(
             scan_data,
             output_path,
-            organization=data.get('organization', 'NTRO'),
-            classification=data.get('classification', 'CONFIDENTIAL')
+            organization=organization,
+            classification=classification
         )
         
         # Save report metadata to database
@@ -84,7 +103,7 @@ def generate_pdf():
             scan_id=scan_id,
             format='pdf',
             filepath=output_path,
-            options=data
+            options=validated_options
         )
         
         return jsonify({
@@ -132,11 +151,23 @@ def generate_excel():
         if not data or 'scan_id' not in data:
             return jsonify({'error': 'scan_id is required'}), 400
         
-        scan_id = data['scan_id']
+        # Validate scan_id format
+        try:
+            scan_id = validate_scan_id_format(data['scan_id'])
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
         
         # Validate scan exists
         if not validate_scan_id(scan_id):
             return jsonify({'error': f'Scan {scan_id} not found'}), 404
+        
+        # Validate and sanitize options
+        try:
+            validated_options = validate_report_options(data)
+            organization = validate_report_organization(data.get('organization'))
+            classification = validate_report_classification(data.get('classification'))
+        except ValueError as e:
+            return jsonify({'error': f'Invalid options: {str(e)}'}), 400
         
         # Get scan data from database
         scan_data = _get_scan_report_data(scan_id)
@@ -154,8 +185,8 @@ def generate_excel():
         generate_excel_report(
             scan_data,
             output_path,
-            organization=data.get('organization', 'NTRO'),
-            classification=data.get('classification', 'CONFIDENTIAL')
+            organization=organization,
+            classification=classification
         )
         
         # Save report metadata to database
@@ -164,7 +195,7 @@ def generate_excel():
             scan_id=scan_id,
             format='excel',
             filepath=output_path,
-            options=data
+            options=validated_options
         )
         
         return jsonify({
@@ -230,8 +261,8 @@ def download_report(report_id: str):
         
     except Exception as e:
         import traceback
-        print(f"Error in download_report: {str(e)}")
-        print(traceback.format_exc())
+        logger.error(f"Error in download_report: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
 
@@ -312,6 +343,32 @@ def delete_report(report_id: str):
 # Helper Functions
 # ============================================================================
 
+@contextmanager
+def get_db_cursor():
+    """
+    Context manager for database cursor with automatic cleanup.
+    
+    Ensures connection and cursor are always properly released,
+    even if exceptions occur during query execution.
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        yield cursor
+        conn.commit()
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            release_db_connection(conn)
+
+
 def _get_scan_report_data(scan_id: str) -> Dict[str, Any]:
     """
     Fetch scan data formatted for report generation.
@@ -322,11 +379,7 @@ def _get_scan_report_data(scan_id: str) -> Dict[str, Any]:
     Returns:
         dict: Formatted scan data
     """
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
+    with get_db_cursor() as cursor:
         # Get scan metadata from correct table
         cursor.execute("""
             SELECT id, target, tool_name, scan_type, status, created_at, 
@@ -370,93 +423,80 @@ def _get_scan_report_data(scan_id: str) -> Dict[str, Any]:
             finding['published_date'] = finding.get('discovered_at', 'N/A')
             finding['exploit_available'] = False  # Default value
         
-        # Get scan summary statistics
+        # Get scan summary statistics using SQL aggregation (optimized)
         cursor.execute("""
             SELECT 
-                total_hosts, total_ports, total_vulnerabilities,
-                critical_count, high_count, medium_count, low_count, info_count
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE severity = 'CRITICAL') as critical,
+                COUNT(*) FILTER (WHERE severity = 'HIGH') as high,
+                COUNT(*) FILTER (WHERE severity = 'MEDIUM') as medium,
+                COUNT(*) FILTER (WHERE severity = 'LOW') as low,
+                COUNT(*) FILTER (WHERE severity IN ('INFO', 'INFORMATIONAL')) as info
+            FROM vulnerabilities
+            WHERE scan_id = %s
+        """, (scan_id,))
+        
+        stats_row = cursor.fetchone()
+        
+        # Get summary for host/port counts
+        cursor.execute("""
+            SELECT total_hosts, total_ports
             FROM scan_summaries
             WHERE scan_id = %s
         """, (scan_id,))
         
         summary_row = cursor.fetchone()
         
-        # Calculate statistics from actual data
-        # Use scan_summaries if available AND has data, otherwise calculate from findings
-        if summary_row:
-            summary_dict = dict(zip([desc[0] for desc in cursor.description], summary_row))
-            total_vulns = summary_dict.get('total_vulnerabilities', 0)
-            
-            # If summary exists but has zero counts, it might be stale - recalculate
-            if total_vulns == 0 and len(findings) > 0:
-                stats = {
-                    'total': len(findings),
-                    'critical': sum(1 for f in findings if f.get('severity', '').upper() == 'CRITICAL'),
-                    'high': sum(1 for f in findings if f.get('severity', '').upper() == 'HIGH'),
-                    'medium': sum(1 for f in findings if f.get('severity', '').upper() == 'MEDIUM'),
-                    'low': sum(1 for f in findings if f.get('severity', '').upper() == 'LOW'),
-                    'info': sum(1 for f in findings if f.get('severity', '').upper() in ('INFO', 'INFORMATIONAL')),
-                    'hosts_scanned': summary_dict.get('total_hosts', 1),
-                    'total_ports': summary_dict.get('total_ports', 0),
-                    'vulnerable_hosts': 1 if len(findings) > 0 else 0,
-                }
+        # Build statistics dict with SQL results
+        if stats_row:
+            stats = dict(zip(['total', 'critical', 'high', 'medium', 'low', 'info'], stats_row))
+            if summary_row:
+                stats['hosts_scanned'] = summary_row[0] or 1
+                stats['total_ports'] = summary_row[1] or 0
             else:
-                stats = {
-                    'total': summary_dict.get('total_vulnerabilities', len(findings)),
-                    'critical': summary_dict.get('critical_count', 0),
-                    'high': summary_dict.get('high_count', 0),
-                    'medium': summary_dict.get('medium_count', 0),
-                    'low': summary_dict.get('low_count', 0),
-                    'info': summary_dict.get('info_count', 0),
-                    'hosts_scanned': summary_dict.get('total_hosts', 1),
-                    'total_ports': summary_dict.get('total_ports', 0),
-                    'vulnerable_hosts': 1 if len(findings) > 0 else 0,
-                }
+                stats['hosts_scanned'] = 1
+                stats['total_ports'] = 0
+            stats['vulnerable_hosts'] = 1 if stats['total'] > 0 else 0
         else:
-            # Fallback: calculate from findings (case-insensitive)
+            # Fallback to empty stats
             stats = {
-                'total': len(findings),
-                'critical': sum(1 for f in findings if f.get('severity', '').upper() == 'CRITICAL'),
-                'high': sum(1 for f in findings if f.get('severity', '').upper() == 'HIGH'),
-                'medium': sum(1 for f in findings if f.get('severity', '').upper() == 'MEDIUM'),
-                'low': sum(1 for f in findings if f.get('severity', '').upper() == 'LOW'),
-                'info': sum(1 for f in findings if f.get('severity', '').upper() in ('INFO', 'INFORMATIONAL')),
+                'total': 0,
+                'critical': 0,
+                'high': 0,
+                'medium': 0,
+                'low': 0,
+                'info': 0,
                 'hosts_scanned': 1,
                 'total_ports': 0,
-                'vulnerable_hosts': 1 if len(findings) > 0 else 0,
+                'vulnerable_hosts': 0,
             }
-        
-        # Generate mitigations from vulnerabilities
-        mitigations = _generate_mitigations(findings)
-        
-        cursor.close()
-        
-        # Format target information
-        target_info = {
-            'name': scan.get('target', 'Unknown'),
-            'ip_range': scan.get('target', 'N/A'),
+    
+    # Generate mitigations from vulnerabilities (outside cursor context)
+    mitigations = _generate_mitigations(findings)
+    
+    # Format target information
+    target_info = {
+        'name': scan.get('target', 'Unknown'),
+        'ip_range': scan.get('target', 'N/A'),
+    }
+    
+    return {
+        'scan_id': scan_id,
+        'timestamp': scan.get('created_at', datetime.now()).isoformat() if scan.get('created_at') else datetime.now().isoformat(),
+        'target': target_info,
+        'summary': _generate_executive_summary(stats, findings),
+        'statistics': stats,
+        'findings': findings,
+        'vulnerabilities': findings,  # Alias for compatibility
+        'mitigations': mitigations,
+        'scan_info': {
+            'tool': scan.get('tool_name', 'N/A'),
+            'scan_type': scan.get('scan_type', 'N/A'),
+            'status': scan.get('status', 'N/A'),
+            'started_at': scan.get('started_at'),
+            'completed_at': scan.get('completed_at'),
         }
-        
-        return {
-            'scan_id': scan_id,
-            'timestamp': scan.get('created_at', datetime.now()).isoformat() if scan.get('created_at') else datetime.now().isoformat(),
-            'target': target_info,
-            'summary': _generate_executive_summary(stats, findings),
-            'statistics': stats,
-            'findings': findings,
-            'vulnerabilities': findings,  # Alias for compatibility
-            'mitigations': mitigations,
-            'scan_info': {
-                'tool': scan.get('tool_name', 'N/A'),
-                'scan_type': scan.get('scan_type', 'N/A'),
-                'status': scan.get('status', 'N/A'),
-                'started_at': scan.get('started_at'),
-                'completed_at': scan.get('completed_at'),
-            }
-        }
-    finally:
-        if conn:
-            release_db_connection(conn)
+    }
 
 
 def _generate_executive_summary(
@@ -625,11 +665,7 @@ def _save_report_metadata(
     options: Dict[str, Any]
 ):
     """Save report metadata to database."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
+    with get_db_cursor() as cursor:
         cursor.execute("""
             INSERT INTO reports (id, scan_id, format, filepath, options, created_at)
             VALUES (%s, %s, %s, %s, %s, %s)
@@ -641,21 +677,11 @@ def _save_report_metadata(
             str(options),
             datetime.now().isoformat()
         ))
-        
-        conn.commit()
-        cursor.close()
-    finally:
-        if conn:
-            release_db_connection(conn)
 
 
 def _get_report_metadata(report_id: str) -> Dict[str, Any]:
     """Retrieve report metadata from database."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
+    with get_db_cursor() as cursor:
         cursor.execute("""
             SELECT id, scan_id, format, filepath, created_at
             FROM reports
@@ -665,25 +691,15 @@ def _get_report_metadata(report_id: str) -> Dict[str, Any]:
         row = cursor.fetchone()
         
         if row:
-            # Get column names before closing cursor
             columns = [desc[0] for desc in cursor.description]
-            cursor.close()
             return dict(zip(columns, row))
         
-        cursor.close()
         return None
-    finally:
-        if conn:
-            release_db_connection(conn)
 
 
 def _get_reports_by_scan(scan_id: str) -> list:
     """Get all reports for a scan."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
+    with get_db_cursor() as cursor:
         cursor.execute("""
             SELECT id, format, created_at
             FROM reports
@@ -691,26 +707,10 @@ def _get_reports_by_scan(scan_id: str) -> list:
             ORDER BY created_at DESC
         """, (scan_id,))
         
-        reports = [dict(zip([desc[0] for desc in cursor.description], row)) for row in cursor.fetchall()]
-        cursor.close()
-        
-        return reports
-    finally:
-        if conn:
-            release_db_connection(conn)
+        return [dict(zip([desc[0] for desc in cursor.description], row)) for row in cursor.fetchall()]
 
 
 def _delete_report_metadata(report_id: str):
     """Delete report metadata from database."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
+    with get_db_cursor() as cursor:
         cursor.execute("DELETE FROM reports WHERE id = %s", (report_id,))
-        
-        conn.commit()
-        cursor.close()
-    finally:
-        if conn:
-            release_db_connection(conn)

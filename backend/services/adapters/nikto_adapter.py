@@ -14,7 +14,7 @@ import os
 import sys
 from defusedxml import ElementTree as ET
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from services.adapters.base_adapter import BaseAdapter
 from utils.wsl_helper import WSLHelper
@@ -88,7 +88,7 @@ class NiktoAdapter(BaseAdapter):
         return {
             "port": 80,
             "ssl": False,
-            "timeout": 600,
+            # No default timeout - use adapter's get_default_timeout() instead (dynamic: 6h for full, 3h for comprehensive, 1.5h for basic)
             "tuning": "1234567890ab",  # All tests
             "format": "xml",
             "evasion": None,
@@ -100,7 +100,8 @@ class NiktoAdapter(BaseAdapter):
         target: str,
         scan_type: str = "basic",
         options: Optional[Dict[str, Any]] = None,
-    ) -> str:
+        temp_filename: Optional[str] = None,
+    ) -> List[str]:
         """
         Build Nikto command using safe array-based construction
 
@@ -108,12 +109,17 @@ class NiktoAdapter(BaseAdapter):
             target: Target URL/hostname
             scan_type: Type of scan (basic, full, quick, ssl, custom)
             options: Additional options
+            temp_filename: Temporary file path for XML output
 
         Returns:
-            Nikto command string
+            WSL command array (e.g., ['wsl.exe', '-d', 'kali-linux', '--', 'nikto', ...])
         """
         if not self.validate_target(target):
             raise ValueError(f"Invalid target: {target}")
+        
+        # Use temp file or fallback to stdout
+        if temp_filename is None:
+            temp_filename = "-"  # Stdout fallback
 
         # 🔒 SECURITY: Use WSLCommandValidator for safe command construction
         from utils.input_validation import WSLCommandValidator
@@ -130,8 +136,18 @@ class NiktoAdapter(BaseAdapter):
 
         # Merge options
         opts = self.get_default_options()
+        logger.info(f"🔍 NUCLEAR FIX ACTIVE - Received options: {options}")
         if options:
-            opts.update(options)
+            logger.info(f"📋 Merging user options: {options}")
+            # CRITICAL: Remove any timeout-related keys to prevent old values from persisting
+            cleaned_options = {k: v for k, v in options.items() if k not in ['timeout', 'per_test_timeout']}
+            if len(cleaned_options) < len(options):
+                logger.warning(f"⚠️ Removed timeout keys from options! Original had: {list(options.keys())}")
+            opts.update(cleaned_options)
+        else:
+            logger.info(f"📋 No user options provided, using defaults only")
+        
+        logger.info(f"📋 Final options for scan: timeout={opts.get('timeout', 'NOT SET')}, per_test_timeout={opts.get('per_test_timeout', 'NOT SET')}")
 
         # Target is already formatted as full URL by parser
         target_url = nikto_target
@@ -144,9 +160,11 @@ class NiktoAdapter(BaseAdapter):
             cmd_parts.extend(["-h", target_url])
             tuning = opts.get("tuning", "1")  # Default: Only interesting files
             cmd_parts.extend(["-Tuning", str(tuning)])
-            cmd_parts.extend(["-timeout", str(opts.get("timeout", 300))])
+            # Per-test timeout (how long Nikto waits for each test response)
+            per_test_timeout = opts.get("per_test_timeout", 60)  # 1 minute per test
+            cmd_parts.extend(["-timeout", str(per_test_timeout)])
             cmd_parts.extend(["-Format", "xml"])  # Always use XML format for reliable parsing
-            cmd_parts.extend(["-output", "-"])  # Output to stdout
+            cmd_parts.extend(["-output", temp_filename])  # Use temp file to avoid stdout corruption
 
         elif scan_type == "ssl":
             # SSL/TLS specific scan (respect user override)
@@ -154,16 +172,24 @@ class NiktoAdapter(BaseAdapter):
             tuning = opts.get("tuning", "b")  # Default: SSL tests
             cmd_parts.extend(["-Tuning", str(tuning)])
             cmd_parts.append("-ssl")
-            cmd_parts.extend(["-timeout", str(opts.get("timeout", 600))])
+            # Per-test timeout
+            per_test_timeout = opts.get("per_test_timeout", 120)  # 2 minutes per test
+            cmd_parts.extend(["-timeout", str(per_test_timeout)])
             cmd_parts.extend(["-Format", "xml"])  # Always use XML format for reliable parsing
-            cmd_parts.extend(["-output", "-"])  # Output to stdout
+            cmd_parts.extend(["-output", temp_filename])  # Use temp file to avoid stdout corruption
 
         elif scan_type == "full":
             # Comprehensive scan (respect user override)
+            # Full scans can take 30-60+ minutes for large sites
             cmd_parts.extend(["-h", target_url])
-            tuning = opts.get("tuning", "1234567890abcde")  # Default: All tests
+            tuning = opts.get("tuning", "1234567890ab")  # Reduced from abcde to avoid extremely slow tests
             cmd_parts.extend(["-Tuning", str(tuning)])
-            cmd_parts.extend(["-timeout", str(opts.get("timeout", 900))])
+            
+            # Per-test timeout (how long Nikto waits for each individual test)
+            # Reduced to 10s for full scans to allow all 4500+ tests to complete within wrapper timeout
+            per_test_timeout = opts.get("per_test_timeout", 10)  # 10 seconds per test (was 120)
+            cmd_parts.extend(["-timeout", str(per_test_timeout)])
+            
             cmd_parts.extend(["-Format", "xml"])  # Always use XML format for reliable parsing
             cmd_parts.extend(["-output", "-"])  # Output to stdout
 
@@ -178,7 +204,7 @@ class NiktoAdapter(BaseAdapter):
             # Custom scan with user options
             cmd_parts.extend(["-h", target_url])
             cmd_parts.extend(["-Format", "xml"])
-            cmd_parts.extend(["-output", "-"])  # Output to stdout
+            cmd_parts.extend(["-output", temp_filename])  # Use temp file to avoid stdout corruption
 
             if "tuning" in opts:
                 cmd_parts.extend(["-Tuning", str(opts["tuning"])])
@@ -186,8 +212,11 @@ class NiktoAdapter(BaseAdapter):
             if opts.get("ssl"):
                 cmd_parts.append("-ssl")
 
-            if "timeout" in opts:
-                cmd_parts.extend(["-timeout", str(opts["timeout"])])
+            # Per-test timeout (not wrapper timeout)
+            if "per_test_timeout" in opts:
+                cmd_parts.extend(["-timeout", str(opts["per_test_timeout"])])
+            else:
+                cmd_parts.extend(["-timeout", "90"])  # Default 90s per test for custom
 
             if "evasion" in opts:
                 cmd_parts.extend(["-evasion", str(opts["evasion"])])
@@ -200,9 +229,13 @@ class NiktoAdapter(BaseAdapter):
             cmd_parts.extend(["-h", target_url])
             tuning = opts.get("tuning", "123456")  # Default: Common tests
             cmd_parts.extend(["-Tuning", str(tuning)])
-            cmd_parts.extend(["-timeout", str(opts.get("timeout", 600))])
+            
+            # Per-test timeout for basic scans
+            per_test_timeout = opts.get("per_test_timeout", 60)  # 1 minute per test
+            cmd_parts.extend(["-timeout", str(per_test_timeout)])
+            
             cmd_parts.extend(["-Format", "xml"])  # Always use XML format for reliable parsing
-            cmd_parts.extend(["-output", "-"])  # Output to stdout
+            cmd_parts.extend(["-output", temp_filename])  # Use temp file to avoid stdout corruption
 
             if opts.get("ssl"):
                 cmd_parts.append("-ssl")
@@ -214,11 +247,8 @@ class NiktoAdapter(BaseAdapter):
                 tool="nikto",
                 tool_args=cmd_parts[1:]  # Skip 'nikto' as it's added by build_wsl_command
             )
-            # Convert array to shell command string (safe because array is pre-validated)
-            import shlex
-            command = ' '.join(shlex.quote(arg) for arg in wsl_cmd)
-            logger.info("Built Nikto command (validated)")
-            return command
+            logger.info("Built Nikto WSL command array (validated)")
+            return wsl_cmd  # Return array instead of string
         except ValueError as e:
             logger.error("Command validation failed: %s", str(e))
             raise
@@ -241,53 +271,125 @@ class NiktoAdapter(BaseAdapter):
             ScanResult object
         """
         from services.adapters.base_adapter import ScanResult
+        import uuid
         
         logger.info("Starting Nikto %s scan on %s", scan_type, target)
+        
+        # Use a secure temporary file (avoids hardcoded /tmp usage and race conditions)
+        import tempfile
+        with tempfile.NamedTemporaryFile(prefix='nikto_', suffix='.xml', delete=False) as tmpf:
+            temp_filename = tmpf.name
 
         # Build command
-        command = self.build_command(target, scan_type, options)
+        command = self.build_command(target, scan_type, options, temp_filename)
+        # Note: caller is responsible for cleaning up the temporary file when finished
+
+        # Dynamic timeout system - scans run until completion unless user sets explicit limit
+        # Default: Very high timeout (6 hours) to allow scan to complete naturally
+        # Users can override with options["timeout"] for faster failure or infinite with timeout=0
+        
+        if options and "timeout" in options:
+            # User explicitly set timeout
+            wrapper_timeout = options["timeout"]
+            if wrapper_timeout == 0:
+                wrapper_timeout = 86400  # 24 hours max safety limit
+                logger.info("Timeout disabled - using safety maximum: 24 hours")
+            else:
+                logger.info("Using user-defined timeout: %ds (%.1f min)", wrapper_timeout, wrapper_timeout/60)
+        else:
+            # Default: Allow scan to run until natural completion
+            # Set very high timeout based on scan type (scans typically finish much sooner)
+            if scan_type == "full":
+                wrapper_timeout = 21600  # 6 hours - full scans on large sites
+                logger.info("Full scan mode - allowing up to %.1f hours for completion", wrapper_timeout/3600)
+            elif scan_type == "comprehensive":
+                wrapper_timeout = 10800  # 3 hours
+                logger.info("Comprehensive scan mode - allowing up to %.1f hours for completion", wrapper_timeout/3600)
+            else:
+                wrapper_timeout = 5400  # 1.5 hours for basic/custom
+                logger.info("Basic scan mode - allowing up to %.1f hours for completion", wrapper_timeout/3600)
 
         # Execute scan
         start_time = datetime.now()
-        result = self.wsl_helper.execute_command(
-            command, timeout=options.get("timeout", 900) if options else 900,
+        logger.info("🚀 Starting scan - will run until completion (max: %.1f hours)", wrapper_timeout/3600)
+        
+        # Use execute_wsl_command_array to avoid double WSL nesting
+        result = self.wsl_helper.execute_wsl_command_array(
+            command, timeout=wrapper_timeout,
             check_success=False  # Nikto may return non-zero on no findings
         )
+        
         end_time = datetime.now()
         execution_time = (end_time - start_time).total_seconds()
+        
+        # Check if scan timed out (return_code=-1 indicates timeout)
+        timed_out = (result.return_code == -1)
+        if timed_out:
+            logger.warning(f"⚠️ Nikto scan timed out after {wrapper_timeout}s - attempting to read partial results")
+        else:
+            logger.info("✅ Nikto scan completed in %.1f seconds (%.1f minutes)", execution_time, execution_time/60)
+        
+        # Read output from temp file
+        xml_output = ""
+        try:
+            cat_result = self.wsl_helper.execute_command(f"cat {temp_filename}", timeout=30)
+            if cat_result.success:
+                xml_output = cat_result.stdout
+                logger.info(f"✅ Read {len(xml_output)} bytes from temp file")
+            else:
+                logger.error(f"Failed to read temp file: {cat_result.stderr}")
+                xml_output = result.stdout  # Fallback to stdout
+        except Exception as e:
+            logger.error(f"Error reading temp file: {e}")
+            xml_output = result.stdout  # Fallback to stdout
+        finally:
+            # Clean up temp file
+            try:
+                self.wsl_helper.execute_command(f"rm -f {temp_filename}", timeout=10)
+            except:
+                pass
 
         # Nikto returns 0 on success, 1 on no findings (which is still OK)
-        # Only treat it as error if stderr has actual error messages
-        if not result.success and result.return_code not in [0, 1]:
+        # Allow timeout (-1) to continue with partial results
+        # Only treat it as error if stderr has actual error messages and no output
+        if not result.success and result.return_code not in [0, 1, -1]:
             error_msg = f"Nikto scan failed: {result.stderr}"
             logger.error(error_msg)
             return ScanResult(
                 success=False,
                 tool="nikto",
                 target=target,
-                raw_output=result.stderr,
+                raw_output=xml_output or result.stderr,
                 error_message=error_msg,
                 execution_time=execution_time,
             )
 
         # Parse output
         try:
-            parsed_data = self.parse_output(result.stdout)
+            parsed_data = self.parse_output(xml_output)
         except Exception as e:
             logger.error("Failed to parse Nikto output: %s", str(e))
             parsed_data = None
 
-        logger.info(
-            "Nikto scan completed in %.2fs. Found %d issues",
-            execution_time,
-            len(parsed_data.get("vulnerabilities", [])) if parsed_data else 0,
-        )
+        vuln_count = len(parsed_data.get("vulnerabilities", [])) if parsed_data else 0
+        
+        if timed_out:
+            logger.warning(
+                f"⚠️ Nikto scan TIMED OUT after {wrapper_timeout}s ({execution_time:.2f}s elapsed). "
+                f"Saved {vuln_count} partial findings"
+            )
+        else:
+            logger.info(
+                "Nikto scan completed in %.2fs. Found %d issues",
+                execution_time,
+                vuln_count,
+            )
 
         return ScanResult(
             success=True,
             tool="nikto",
             target=target,
-            raw_output=result.stdout,
+            raw_output=xml_output,
             parsed_output=parsed_data,
             execution_time=execution_time,
             scan_metadata={"scan_type": scan_type},

@@ -70,6 +70,12 @@ export const scanApi = {
     await api.delete(`/scans/${scanId}`);
   },
 
+  // Retry failed scan
+  retryScan: async (scanId: string): Promise<Scan> => {
+    const response = await api.post<Scan>(`/scans/${scanId}/retry`);
+    return response.data;
+  },
+
   // Get scan status
   getScanStatus: async (scanId: string): Promise<ScanStatusResponse> => {
     const response = await api.get<ScanStatusResponse>(`/scans/${scanId}/status`);

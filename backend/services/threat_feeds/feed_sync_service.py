@@ -16,6 +16,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from pathlib import Path
+from contextlib import contextmanager
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -25,6 +26,30 @@ from services.threat_feeds.exploitdb_client import ExploitDBClient
 from config.database import get_db_connection, release_db_connection
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def get_db_cursor():
+    """
+    Context manager for database cursor with automatic cleanup.
+    Ensures cursor and connection are properly closed in all code paths.
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        yield cursor
+        conn.commit()
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            release_db_connection(conn)
 
 
 class FeedSyncService:
@@ -77,19 +102,14 @@ class FeedSyncService:
                 return stats
             
             # Store in database
-            conn = None
-            try:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                
+            with get_db_cursor() as cursor:
                 for cve_data in cves:
                     try:
                         result = self._upsert_nvd_cve(cursor, cve_data)
                         stats[result] += 1
                         
-                        # Commit every 20 entries for large batches
+                        # Periodic logging for large batches
                         if (stats['new'] + stats['updated']) % 20 == 0:
-                            conn.commit()
                             logger.info(f"Progress: {stats['new']} new, {stats['updated']} updated")
                     
                     except Exception as e:
@@ -97,14 +117,7 @@ class FeedSyncService:
                         stats['errors'] += 1
                         continue
                 
-                conn.commit()
                 logger.info(f"NVD sync complete: {stats}")
-                
-            finally:
-                if cursor:
-                    cursor.close()
-                if conn:
-                    release_db_connection(conn)
         
         except Exception as e:
             logger.error(f"Error during NVD sync: {e}")
@@ -141,18 +154,14 @@ class FeedSyncService:
                 return stats
             
             # Store in database
-            conn = None
-            try:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                
+            with get_db_cursor() as cursor:
                 for exploit in exploits:
                     try:
                         result = self._upsert_exploitdb_entry(cursor, exploit)
                         stats[result] += 1
                         
+                        # Periodic logging
                         if (stats['new'] + stats['updated']) % 10 == 0:
-                            conn.commit()
                             logger.info(f"Progress: {stats['new']} new, {stats['updated']} updated")
                     
                     except Exception as e:
@@ -160,14 +169,7 @@ class FeedSyncService:
                         stats['errors'] += 1
                         continue
                 
-                conn.commit()
                 logger.info(f"ExploitDB sync complete: {stats}")
-                
-            finally:
-                if cursor:
-                    cursor.close()
-                if conn:
-                    release_db_connection(conn)
         
         except Exception as e:
             logger.error(f"Error during ExploitDB sync: {e}")

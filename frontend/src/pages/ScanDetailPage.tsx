@@ -7,6 +7,7 @@ import type { Scan, RawResult, ParsedResult } from '../types';
 import { formatDate, formatDuration, getStatusBadgeClass, getSeverityColor } from '../utils/helpers';
 import { TextShimmer } from '../components/ui/text-shimmer';
 import { InteractiveHoverButton } from '../components/ui/interactive-hover-button';
+import { useWebSocket } from '../hooks/useWebSocket';
 
 const ScanDetailPage = () => {
   const { scanId } = useParams<{ scanId: string }>();
@@ -19,33 +20,73 @@ const ScanDetailPage = () => {
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const exportMenuRef = useRef<HTMLDivElement>(null);
+
+  // WebSocket for real-time progress updates
+  const { subscribe, unsubscribe } = useWebSocket({
+    onMessage: (message) => {
+      console.log('📡 WebSocket message received:', message);
+      
+      if (message.scan_id === scanId) {
+        console.log('✅ Message is for this scan:', scanId);
+        
+        // Update scan data in real-time
+        if (message.type === 'scan_update' && message.data) {
+          console.log('📊 Updating progress:', message.data.progress, 'Message:', message.data.message);
+          setScan(prev => prev ? {
+            ...prev,
+            status: message.data.status || prev.status,
+            progress: message.data.progress ?? prev.progress,
+            progress_message: message.data.progress_message || message.data.message || prev.progress_message,
+          } : null);
+        }
+        
+        // Refresh full data when scan completes or fails
+        if (message.type === 'scan_complete' || message.type === 'scan_failed') {
+          fetchData();
+        }
+      } else {
+        console.log('⚠️ Message is for different scan:', message.scan_id, 'Expected:', scanId);
+      }
+    }
+  });
+
+  // Subscribe to scan updates when component mounts
+  useEffect(() => {
+    if (scanId) {
+      subscribe(scanId);
+      return () => unsubscribe(scanId);
+    }
+  }, [scanId, subscribe, unsubscribe]);
+
+  const fetchData = async () => {
+    if (!scanId) return;
+    
+    try {
+      const [scanData, rawData, parsedData] = await Promise.all([
+        scanApi.getScan(scanId),
+        scanApi.getRawResults(scanId).catch(() => ({ results: [] })),
+        scanApi.getParsedResults(scanId).catch(() => null),
+      ]);
+      setScan(scanData);
+      setRawResults(rawData.results);
+      if (parsedData) {
+        setParsedResults(parsedData);
+      }
+    } catch (error) {
+      console.error('Failed to fetch scan details:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
     if (!scanId) return;
 
-    const fetchData = async () => {
-      try {
-        const [scanData, rawData, parsedData] = await Promise.all([
-          scanApi.getScan(scanId),
-          scanApi.getRawResults(scanId).catch(() => ({ results: [] })),
-          scanApi.getParsedResults(scanId).catch(() => null),
-        ]);
-        setScan(scanData);
-        setRawResults(rawData.results);
-        if (parsedData) {
-          setParsedResults(parsedData);
-        }
-      } catch (error) {
-        console.error('Failed to fetch scan details:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
-
     fetchData();
     
-    // Refresh if scan is running
+    // Refresh if scan is running (fallback if WebSocket fails)
     const interval = setInterval(() => {
       if (scan?.status === 'running' || scan?.status === 'queued') {
         fetchData();
@@ -75,6 +116,22 @@ const ScanDetailPage = () => {
       navigate('/scans');
     } catch (error) {
       console.error('Failed to delete scan:', error);
+    }
+  };
+
+  const handleRetry = async () => {
+    if (!scanId || !confirm('Retry this failed scan?')) return;
+
+    setRetrying(true);
+    try {
+      const updatedScan = await scanApi.retryScan(scanId);
+      setScan(updatedScan);
+      alert('Scan has been re-queued successfully!');
+    } catch (error: any) {
+      console.error('Failed to retry scan:', error);
+      alert(`Failed to retry scan: ${error.response?.data?.message || error.message || 'Unknown error'}`);
+    } finally {
+      setRetrying(false);
     }
   };
 
@@ -137,6 +194,16 @@ const ScanDetailPage = () => {
           </div>
         </div>
         <div className="flex gap-2">
+          {/* Retry Button - Only show for failed scans */}
+          {scan.status === 'failed' && (
+            <InteractiveHoverButton
+              onClick={handleRetry}
+              disabled={retrying}
+              text={retrying ? "Retrying..." : "Retry"}
+              className="w-auto px-6 bg-blue-600 hover:bg-blue-700"
+            />
+          )}
+          
           {/* Export Dropdown */}
           <div className="relative" ref={exportMenuRef}>
             <InteractiveHoverButton
@@ -294,6 +361,17 @@ const ScanDetailPage = () => {
                   <dt className="text-sm text-gray-800 dark:text-gray-700">Scan Type</dt>
                   <dd className="text-gray-900 dark:text-white mt-1">{scan.scan_type}</dd>
                 </div>
+                {scan.error_message && scan.status === 'failed' && (
+                  <div className="md:col-span-2">
+                    <dt className="text-sm text-red-600 dark:text-red-400 flex items-center gap-2">
+                      <TriangleAlert className="w-4 h-4" />
+                      Error Message
+                    </dt>
+                    <dd className="text-red-900 dark:text-red-300 mt-1 font-mono text-sm bg-red-50 dark:bg-red-900/20 p-3 rounded-lg">
+                      {scan.error_message}
+                    </dd>
+                  </div>
+                )}
                 {scan.started_at && (
                   <div>
                     <dt className="text-sm text-gray-800 dark:text-gray-700">Started At</dt>

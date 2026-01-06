@@ -31,8 +31,9 @@ Usage:
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
+import threading
 
 from flask import request
 from flask_socketio import SocketIO, emit, join_room, leave_room
@@ -50,8 +51,52 @@ socketio = SocketIO(
     ping_interval=25,
 )
 
-# Track connected clients per scan
-scan_rooms: dict[str, Any] = {}  # {scan_id: set(session_ids)}
+# Track connected clients per scan with TTL
+# Format: {scan_id: {'clients': set(session_ids), 'last_activity': datetime}}
+scan_rooms: dict[str, dict[str, Any]] = {}
+scan_rooms_lock = threading.Lock()  # Thread-safe access to scan_rooms
+
+# Configuration
+ROOM_TTL_MINUTES = 60  # Remove inactive rooms after 1 hour
+CLEANUP_INTERVAL_SECONDS = 300  # Run cleanup every 5 minutes
+
+
+def cleanup_inactive_rooms():
+    """
+    Clean up inactive rooms periodically to prevent memory leaks
+    
+    Removes rooms that have been inactive for more than ROOM_TTL_MINUTES.
+    This prevents the scan_rooms dictionary from growing unbounded.
+    """
+    while True:
+        try:
+            import time
+            time.sleep(CLEANUP_INTERVAL_SECONDS)
+            
+            now = datetime.now()
+            cutoff_time = now - timedelta(minutes=ROOM_TTL_MINUTES)
+            rooms_removed = 0
+            
+            with scan_rooms_lock:
+                rooms_to_remove = [
+                    scan_id for scan_id, room_data in scan_rooms.items()
+                    if room_data['last_activity'] < cutoff_time
+                ]
+                
+                for scan_id in rooms_to_remove:
+                    client_count = len(scan_rooms[scan_id]['clients'])
+                    del scan_rooms[scan_id]
+                    rooms_removed += 1
+                    logger.info(
+                        "Cleaned up inactive room %s (%d clients, inactive for %d+ minutes)",
+                        scan_id, client_count, ROOM_TTL_MINUTES
+                    )
+            
+            if rooms_removed > 0:
+                logger.info("Cleanup complete: Removed %d inactive rooms", rooms_removed)
+                
+        except Exception as e:
+            logger.error("Error in room cleanup task: %s", e, exc_info=True)
 
 
 def init_socketio(app):
@@ -69,6 +114,14 @@ def init_socketio(app):
     logger.info("   Async mode: %s", socketio.async_mode)
     logger.info("   CORS: Enabled for all origins (*)")
     logger.info("   Ping timeout: 60s, Ping interval: 25s")
+    logger.info("   Room TTL: %d minutes", ROOM_TTL_MINUTES)
+    logger.info("   Cleanup interval: %d seconds", CLEANUP_INTERVAL_SECONDS)
+    
+    # Start background cleanup task
+    cleanup_thread = threading.Thread(target=cleanup_inactive_rooms, daemon=True)
+    cleanup_thread.start()
+    logger.info("✅ Room cleanup task started")
+    
     return socketio
 
 
@@ -89,18 +142,22 @@ def handle_connect():
 
 @socketio.on("disconnect")
 def handle_disconnect():
-    """Handle client disconnection"""
+    """Handle client disconnection and cleanup"""
     client_id = request.sid
     logger.info("Client disconnected: %s", client_id)
 
-    # Remove client from all scan rooms
+    # Remove client from all scan rooms (thread-safe)
     rooms_to_remove = []
-    for scan_id, clients in list(scan_rooms.items()):  # Use list() to avoid RuntimeError
-        if client_id in clients:
-            clients.discard(client_id)
-            rooms_to_remove.append(scan_id)
-            if len(clients) == 0:
-                del scan_rooms[scan_id]
+    with scan_rooms_lock:
+        for scan_id, room_data in list(scan_rooms.items()):
+            clients = room_data['clients']
+            if client_id in clients:
+                clients.discard(client_id)
+                rooms_to_remove.append(scan_id)
+                # Remove empty rooms immediately
+                if len(clients) == 0:
+                    del scan_rooms[scan_id]
+                    logger.debug("Removed empty room: %s", scan_id)
 
     logger.info("Client %s removed from %d rooms", client_id, len(rooms_to_remove))
 
@@ -127,20 +184,27 @@ def handle_subscribe_scan(data):
     # Join room
     join_room(scan_id)
 
-    # Track subscription
-    if scan_id not in scan_rooms:
-        scan_rooms[scan_id] = set()
-    scan_rooms[scan_id].add(client_id)
+    # Track subscription (thread-safe with TTL)
+    now = datetime.now()
+    with scan_rooms_lock:
+        if scan_id not in scan_rooms:
+            scan_rooms[scan_id] = {
+                'clients': set(),
+                'last_activity': now
+            }
+        scan_rooms[scan_id]['clients'].add(client_id)
+        scan_rooms[scan_id]['last_activity'] = now  # Update activity timestamp
+        room_size = len(scan_rooms[scan_id]['clients'])
 
     logger.info("Client %s subscribed to scan %s", client_id, scan_id)
-    logger.info("Room %s now has %d subscribers", scan_id, len(scan_rooms[scan_id]))
+    logger.info("Room %s now has %d subscribers", scan_id, room_size)
 
     emit(
         "subscription_confirmed",
         {
             "scan_id": scan_id,
-            "timestamp": datetime.now().isoformat(),
-            "room_size": len(scan_rooms[scan_id]),
+            "timestamp": now.isoformat(),
+            "room_size": room_size,
         },
     )
 
@@ -161,16 +225,22 @@ def handle_unsubscribe_scan(data):
 
     if not scan_id:
         logger.warning("Client %s tried to unsubscribe without scan_id", client_id)
+        emit("unsubscription_error", {"error": "scan_id required"})
         return
 
     # Leave room
     leave_room(scan_id)
 
-    # Remove from tracking
-    if scan_id in scan_rooms and client_id in scan_rooms[scan_id]:
-        scan_rooms[scan_id].discard(client_id)
-        if len(scan_rooms[scan_id]) == 0:
-            del scan_rooms[scan_id]
+    # Remove from tracking (thread-safe)
+    with scan_rooms_lock:
+        if scan_id in scan_rooms:
+            clients = scan_rooms[scan_id]['clients']
+            if client_id in clients:
+                clients.discard(client_id)
+                # Remove empty rooms immediately
+                if len(clients) == 0:
+                    del scan_rooms[scan_id]
+                    logger.debug("Removed empty room after unsubscribe: %s", scan_id)
 
     logger.info("Client %s unsubscribed from scan %s", client_id, scan_id)
 
@@ -211,7 +281,7 @@ def emit_scan_event(scan_id, event_type, data):
         if socketio is None:
             logger.debug("SocketIO not initialized, skipping event %s for %s", event_type, scan_id)
             return
-            
+
         # Add metadata
         payload = {
             **data,
@@ -223,8 +293,14 @@ def emit_scan_event(scan_id, event_type, data):
         # Broadcast to room
         socketio.emit(event_type, payload, room=scan_id, namespace="/")
 
-        # Log emission
-        subscriber_count = len(scan_rooms.get(scan_id, set()))
+        # Update last activity timestamp and get subscriber count (thread-safe)
+        with scan_rooms_lock:
+            if scan_id in scan_rooms:
+                scan_rooms[scan_id]['last_activity'] = datetime.now()
+                subscriber_count = len(scan_rooms[scan_id]['clients'])
+            else:
+                subscriber_count = 0
+        
         logger.info(
             "Emitted %s for %s to %d subscribers", event_type, scan_id, subscriber_count
         )
@@ -264,6 +340,7 @@ def emit_scan_progress(scan_id, progress, message=""):
         progress: Progress percentage (0-100)
         message: Optional status message
     """
+    # Emit WebSocket event
     emit_scan_event(
         scan_id,
         "scan_progress",
@@ -307,16 +384,29 @@ def emit_scan_failed(scan_id, error_message):
 
 def get_room_stats():
     """
-    Get statistics about active rooms and connections
+    Get statistics about active rooms and connections (thread-safe)
 
     Returns:
-        dict: Statistics including room count, total subscribers
+        dict: Statistics including room count, total subscribers, TTL info
     """
-    return {
-        "total_rooms": len(scan_rooms),
-        "total_subscribers": sum(len(clients) for clients in scan_rooms.values()),
-        "rooms": {scan_id: len(clients) for scan_id, clients in scan_rooms.items()},
-    }
+    with scan_rooms_lock:
+        stats = {
+            "total_rooms": len(scan_rooms),
+            "total_subscribers": sum(len(room['clients']) for room in scan_rooms.values()),
+            "rooms": {
+                scan_id: {
+                    'subscriber_count': len(room['clients']),
+                    'last_activity': room['last_activity'].isoformat(),
+                    'age_minutes': (datetime.now() - room['last_activity']).total_seconds() / 60
+                }
+                for scan_id, room in scan_rooms.items()
+            },
+            "config": {
+                "ttl_minutes": ROOM_TTL_MINUTES,
+                "cleanup_interval_seconds": CLEANUP_INTERVAL_SECONDS
+            }
+        }
+    return stats
 
 
 # Export functions

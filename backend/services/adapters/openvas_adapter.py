@@ -11,7 +11,7 @@ Date: 2025-10-26
 import logging
 import re
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from utils.parsers import OpenVASParser
 from utils.target_parser import UniversalTargetParser
@@ -85,8 +85,11 @@ class OpenVASAdapter(BaseAdapter):
         }
 
     def get_default_timeout(self) -> int:
-        """OpenVAS scans can take very long"""
-        return 7200  # 2 hours (OpenVAS scans often exceed 1 hour)
+        """
+        Dynamic timeout - OpenVAS vulnerability scans can be very slow
+        Scans run until natural completion (safety limit: 8 hours)
+        """
+        return 28800  # 8 hours - OpenVAS vulnerability scans are comprehensive
 
     def validate_target(self, target: str) -> bool:
         """
@@ -116,7 +119,7 @@ class OpenVASAdapter(BaseAdapter):
 
     def build_command(
         self, target: str, scan_type: str, options: Dict[str, Any]
-    ) -> str:
+    ) -> List[str]:
         """
         Build OpenVAS/GVM scan command using python-gvm library (safe construction)
 
@@ -134,7 +137,7 @@ class OpenVASAdapter(BaseAdapter):
             options: Additional options (scan_config, port_list, alive_test, max_checks, max_hosts)
 
         Returns:
-            Command string to execute the Python script
+            WSL command array (e.g., ['wsl.exe', '-d', 'kali-linux', '--', 'python3', ...])
             
         Raises:
             ValueError: If target is invalid
@@ -199,6 +202,16 @@ class OpenVASAdapter(BaseAdapter):
             import json
             cmd_parts.append(json.dumps(openvas_options))
         
+        # Add temp output file to avoid stdout corruption
+        import tempfile
+        tmpf = tempfile.NamedTemporaryFile(prefix='openvas_', suffix='.xml', delete=False)
+        temp_filename = tmpf.name
+        tmpf.close()
+        cmd_parts.append(temp_filename)
+        
+        # Store temp filename for reading later
+        self._temp_output_file = temp_filename
+        
         # 🔒 SECURITY: Build safe WSL command using validator
         try:
             wsl_cmd = WSLCommandValidator.build_wsl_command(
@@ -206,11 +219,8 @@ class OpenVASAdapter(BaseAdapter):
                 tool="python3",
                 tool_args=cmd_parts
             )
-            # Convert array to shell command string (safe because array is pre-validated)
-            import shlex
-            command = ' '.join(shlex.quote(arg) for arg in wsl_cmd)
-            logger.info("Built GVM scan command using python-gvm library (validated)")
-            return command
+            logger.info("Built GVM scan WSL command array using python-gvm library (validated)")
+            return wsl_cmd
         except ValueError as e:
             logger.error("Command validation failed: %s", str(e))
             raise
@@ -272,40 +282,81 @@ class OpenVASAdapter(BaseAdapter):
         )
         end_time = datetime.now()
         execution_time = (end_time - start_time).total_seconds()
+        
+        # Check if scan timed out (return_code=-1 indicates timeout)
+        timed_out = (result.return_code == -1)
+        if timed_out:
+            logger.warning(f"⚠️ OpenVAS scan timed out after {exec_timeout}s - attempting to read partial results")
+        
+        # Read output from temp file (protects against stdout corruption)
+        xml_output = ""
+        if hasattr(self, '_temp_output_file'):
+            try:
+                cat_result = self.wsl_helper.execute_command(f"cat {self._temp_output_file}", timeout=30)
+                if cat_result.success:
+                    xml_output = cat_result.stdout
+                    logger.info(f"✅ Read {len(xml_output)} bytes from OpenVAS temp file")
+                else:
+                    logger.error(f"Failed to read temp file: {cat_result.stderr}")
+                    xml_output = result.stdout  # Fallback to stdout
+            except Exception as e:
+                logger.error(f"Error reading temp file: {e}")
+                xml_output = result.stdout  # Fallback to stdout
+            finally:
+                # Clean up temp file
+                try:
+                    self.wsl_helper.execute_command(f"rm -f {self._temp_output_file}", timeout=10)
+                except:
+                    pass
+        else:
+            xml_output = result.stdout  # Fallback if temp file wasn't created
 
-        # Check for errors
-        if not result.success:
+        # Check for errors (allow timeout to continue with partial results)
+        if not result.success and result.return_code not in [-1]:
             error_msg = f"OpenVAS scan failed: {result.stderr}"
             logger.error(error_msg)
             return ScanResult(
                 success=False,
                 tool="openvas",
                 target=target,
-                raw_output=result.stderr,
+                raw_output=xml_output or result.stderr,
                 error_message=error_msg,
                 execution_time=execution_time,
             )
 
         # Parse output
         try:
-            parsed_data = self.parse_output(result.stdout)
+            parsed_data = self.parse_output(xml_output)
         except Exception as e:
             logger.error("Failed to parse OpenVAS output: %s", str(e))
             parsed_data = None
 
-        logger.info(
-            "OpenVAS scan completed in %.2fs",
-            execution_time
-        )
+        vuln_count = len(parsed_data.get("vulnerabilities", [])) if parsed_data else 0
+        
+        if timed_out:
+            logger.warning(
+                f"⚠️ OpenVAS scan TIMED OUT after {exec_timeout}s ({execution_time:.2f}s elapsed). "
+                f"Saved {vuln_count} partial findings"
+            )
+        else:
+            logger.info(
+                "OpenVAS scan completed in %.2fs. Found %d vulnerabilities",
+                execution_time,
+                vuln_count
+            )
 
         return ScanResult(
             success=True,
             tool="openvas",
             target=target,
-            raw_output=result.stdout,
+            raw_output=xml_output,
             parsed_output=parsed_data,
             execution_time=execution_time,
-            scan_metadata={"scan_type": scan_type},
+            scan_metadata={
+                "scan_type": scan_type,
+                "timed_out": timed_out,
+                "timeout_seconds": exec_timeout if timed_out else None
+            },
         )
 
     def parse_results(self, raw_output: str) -> Dict[str, Any]:

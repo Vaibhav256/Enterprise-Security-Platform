@@ -7,10 +7,12 @@ Based on RAG_PIPELINE_DESIGN.md and LLM_SELECTION_REPORT.md.
 import requests
 import re
 import json
+import threading
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
+from cachetools import TTLCache
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -87,11 +89,15 @@ class RAGChatbot:
                 self.use_redis = True
                 logger.info("✓ Using Redis for session persistence")
             except Exception as e:
-                logger.warning(f"Redis unavailable ({e}), using in-memory sessions")
-                self.sessions: Dict[str, ChatSession] = {}
+                logger.warning(f"Redis unavailable ({e}), using in-memory sessions with TTL")
+                # Use TTL cache instead of unbounded dict: maxsize=1000 sessions, ttl=session_ttl seconds
+                self.sessions = TTLCache(maxsize=1000, ttl=session_ttl)
+                self._sessions_lock = threading.Lock()  # Thread safety for sessions
         else:
-            logger.warning("⚠️  Redis not configured - sessions lost on restart")
-            self.sessions: Dict[str, ChatSession] = {}
+            logger.warning(f"⚠️  Redis not configured - using in-memory sessions (TTL: {session_ttl}s)")
+            # Use TTL cache instead of unbounded dict: maxsize=1000 sessions, ttl=session_ttl seconds
+            self.sessions = TTLCache(maxsize=1000, ttl=session_ttl)
+            self._sessions_lock = threading.Lock()  # Thread safety for sessions
         
         # Initialize MCP web proxy
         try:
@@ -104,8 +110,9 @@ class RAGChatbot:
             self.mcp_enabled = False
             logger.warning("⚠️  MCP web proxy not available")
         
-        # Scan cache for scan ID loading
-        self.scan_cache: Dict[str, Dict] = {}
+        # Scan cache for scan ID loading with TTL (1 hour expiration, maxsize=500 scans)
+        self.scan_cache = TTLCache(maxsize=500, ttl=3600)  # 1 hour TTL
+        self._scan_cache_lock = threading.Lock()  # Thread safety for scan cache
         
         # System prompt
         self.system_prompt = self._build_system_prompt()
@@ -153,9 +160,10 @@ class RAGChatbot:
         - severity_counts: Dict[str, int]
         """
         # Check cache
-        if scan_id in self.scan_cache:
-            logger.info(f"📦 Using cached scan data for {scan_id[:8]}")
-            return self.scan_cache[scan_id]
+        with self._scan_cache_lock:
+            if scan_id in self.scan_cache:
+                logger.info(f"📦 Using cached scan data for {scan_id[:8]}")
+                return self.scan_cache[scan_id]
         
         try:
             from services.data_ingestor.models import SessionLocal, Scan, ScanStatus
@@ -213,8 +221,9 @@ class RAGChatbot:
                     'severity_counts': severity_counts
                 }
                 
-                # Cache it
-                self.scan_cache[scan.id] = scan_data
+                # Cache it with thread safety
+                with self._scan_cache_lock:
+                    self.scan_cache[scan.id] = scan_data
                 logger.info(f"✅ Loaded scan {scan.id[:8]}: {len(vuln_dicts)} vulnerabilities")
                 
                 return scan_data
@@ -243,21 +252,46 @@ class RAGChatbot:
 
 ## Vulnerabilities Found
 """
-        for i, vuln in enumerate(scan_data['vulnerabilities'][:10], 1):  # Limit to 10 for context
-            desc = vuln['description'][:150] if vuln['description'] else 'No description'
-            solution = vuln['solution'][:150] if vuln['solution'] else 'No solution available'
+        for i, vuln in enumerate(scan_data['vulnerabilities'][:15], 1):  # Increased to 15 for better context
+            desc = vuln['description'][:200] if vuln['description'] else 'No description'
+            solution = vuln['solution'][:200] if vuln['solution'] else 'No solution available'
             
-            context += f"""
-### {i}. {vuln['title']} ({vuln['severity']})
-- **CVE ID**: {vuln['cve_id'] or 'N/A'}
-- **CVSS Score**: {vuln['cvss_score'] or 'N/A'}
-- **Port/Service**: {vuln['port'] or 'N/A'}/{vuln['service'] or 'N/A'}
-- **Description**: {desc}...
-- **Solution**: {solution}...
-"""
+            # Build vulnerability entry with all available info
+            vuln_entry = f"\n### {i}. {vuln['title']} ({vuln['severity']})\n"
+            vuln_entry += f"- **CVE ID**: {vuln['cve_id'] or 'N/A'}\n"
+            
+            # Add CVSS if available
+            if vuln['cvss_score']:
+                vuln_entry += f"- **CVSS Score**: {vuln['cvss_score']}\n"
+            
+            # Add Port/Service if available (important for Nmap)
+            if vuln['port'] or vuln['service']:
+                vuln_entry += f"- **Port/Service**: {vuln['port'] or 'N/A'}/{vuln['service'] or 'N/A'}\n"
+            
+            # Add protocol if available
+            if vuln.get('protocol'):
+                vuln_entry += f"- **Protocol**: {vuln['protocol']}\n"
+            
+            # Always include description
+            vuln_entry += f"- **Description**: {desc}...\n"
+            
+            # Add solution if available
+            if vuln['solution'] and vuln['solution'].strip():
+                vuln_entry += f"- **Solution**: {solution}...\n"
+            
+            # Add references if available (important for OpenVAS, Nuclei)
+            if vuln.get('references') and vuln['references']:
+                refs = vuln['references']
+                if isinstance(refs, list):
+                    refs_str = ', '.join(refs[:3])  # First 3 references
+                else:
+                    refs_str = str(refs)[:100]
+                vuln_entry += f"- **References**: {refs_str}\n"
+            
+            context += vuln_entry
         
-        if scan_data['total_vulns'] > 10:
-            context += f"\n... and {scan_data['total_vulns'] - 10} more vulnerabilities\n"
+        if scan_data['total_vulns'] > 15:
+            context += f"\n... and {scan_data['total_vulns'] - 15} more vulnerabilities\n"
         
         return context
     
@@ -274,6 +308,7 @@ class RAGChatbot:
             Tuple of (enhanced_context, web_data_added)
         """
         if not self.mcp_enabled:
+            logger.info("ℹ️  MCP proxy not enabled - skipping web enhancement")
             return context, False
         
         # Detect CVE mentions in query
@@ -295,10 +330,60 @@ class RAGChatbot:
         if not cves:
             context_cves = re.findall(cve_pattern, context, re.IGNORECASE)
             if context_cves:
-                cves = context_cves[:3]  # Limit to 3
-                logger.info(f"🔍 Found {len(cves)} CVE(s) from retrieved context: {cves}")
+                cves = list(set(context_cves))[:3]  # Unique CVEs, limit to 3
+                logger.info(f"🔍 Found {len(context_cves)} CVE(s) from retrieved context: {cves}")
+            else:
+                logger.info(f"🔍 No CVEs found in context (checked {len(context)} chars)")
+                
+                # 🆕 FALLBACK: Check if context contains vulnerability scan data
+                # Even without CVE IDs, we can still enhance with general threat intel
+                vuln_keywords = ['vulnerability', 'vulnerabilities', 'severity', 'CVSS', 'exploit', 'scan', 'port', 'service']
+                has_vuln_context = any(keyword.lower() in context.lower() for keyword in vuln_keywords)
+                
+                if has_vuln_context:
+                    logger.info(f"🔍 Detected vulnerability context without CVE IDs - extracting software/service info")
+                    
+                    # Extract software/service names and versions
+                    software_info = []
+                    
+                    # Pattern 1: Standard software with versions (PHP/5.6.40, Apache/2.4.7)
+                    software_pattern1 = r'\b(PHP|Apache|nginx|MySQL|PostgreSQL|OpenSSL|Java|Python|Node\.js|IIS|Tomcat|Redis|MongoDB|OpenSSH|ProFTPD|vsftpd|Samba|Bind|Postfix|Sendmail|Dovecot|WordPress|Joomla|Drupal|SSH|FTP|HTTP|HTTPS|SSL|TLS)/?([\d.]+[a-z0-9._-]*)?'
+                    matches1 = re.findall(software_pattern1, context, re.IGNORECASE)
+                    for name, version in matches1:
+                        if version:  # Only add if version found
+                            software_info.append((name, version))
+                    
+                    # Pattern 2: Service version format (ssh 6.6.1p1, http 2.4.7)
+                    service_pattern = r'\b(ssh|http|https|ftp|smtp|mysql|postgresql|redis|mongodb|nginx|apache)\s+([\d.]+[a-z0-9._-]*)'
+                    matches2 = re.findall(service_pattern, context, re.IGNORECASE)
+                    for name, version in matches2:
+                        software_info.append((name, version))
+                    
+                    # Pattern 3: Common web frameworks/CMS
+                    framework_pattern = r'\b(Drupal|WordPress|Joomla|Laravel|Django|Flask|Ruby on Rails|Express|Spring|ASP\.NET)\s+(?:version\s+)?([\d.]+)?'
+                    matches3 = re.findall(framework_pattern, context, re.IGNORECASE)
+                    for name, version in matches3:
+                        if version:
+                            software_info.append((name, version))
+                    
+                    # Remove duplicates and limit
+                    software_info = list(set(software_info))[:5]
+                    
+                    if software_info:
+                        logger.info(f"🔍 Found {len(software_info)} software versions: {software_info} - querying threat intelligence")
+                        
+                        # Query threat intelligence for these software versions
+                        enhanced_context = self._enhance_with_software_intel(context, software_info)
+                        if enhanced_context != context:
+                            return enhanced_context, True
+                        else:
+                            logger.info("ℹ️  No additional threat intelligence found for software versions")
+                            return context, False
+                    else:
+                        logger.info("🔍 No software versions detected in context")
         
         if not cves:
+            logger.info(f"ℹ️  No CVEs detected - skipping web enhancement")
             return context, False
         
         logger.info(f"🌐 Web lookup triggered for CVEs: {cves}")
@@ -336,6 +421,71 @@ class RAGChatbot:
         
         return context, False
     
+    def _enhance_with_software_intel(self, context: str, software_info: List[Tuple[str, str]]) -> str:
+        """
+        Enhance context with threat intelligence for detected software versions.
+        
+        Args:
+            context: Existing context
+            software_info: List of (software_name, version) tuples
+        
+        Returns:
+            Enhanced context with threat intelligence
+        """
+        web_data = []
+        
+        try:
+            # Import threat intelligence clients
+            from services.threat_feeds.exploitdb_client import ExploitDBClient
+            
+            exploitdb_client = ExploitDBClient(api_key=None)  # Uses public API
+            
+            for software, version in software_info:
+                try:
+                    # Build search query
+                    if version:
+                        search_query = f"{software} {version}"
+                        logger.info(f"   🔍 Searching ExploitDB for: {search_query}")
+                    else:
+                        search_query = software
+                        logger.info(f"   🔍 Searching ExploitDB for: {software}")
+                    
+                    # Search ExploitDB (searches title/description, not CVE-specific)
+                    exploits = exploitdb_client.search_exploits(keyword=search_query, max_results=3)
+                    
+                    if exploits:
+                        exploit_summary = f"\n**🔥 Known Exploits for {software}"
+                        if version:
+                            exploit_summary += f" {version}"
+                        exploit_summary += ":**\n"
+                        
+                        for exploit in exploits[:3]:  # Limit to top 3
+                            exploit_summary += f"- {exploit.get('title', 'Untitled')} ({exploit.get('type', 'N/A')})\n"
+                            exploit_summary += f"  Platform: {exploit.get('platform', 'N/A')} | "
+                            exploit_summary += f"Published: {exploit.get('date_published', 'N/A')}\n"
+                            if exploit.get('url'):
+                                exploit_summary += f"  URL: {exploit['url']}\n"
+                        
+                        web_data.append(exploit_summary)
+                        logger.info(f"   ✅ Found {len(exploits)} exploits for {software}")
+                    else:
+                        logger.info(f"   ℹ️  No exploits found for {software}")
+                        
+                except Exception as e:
+                    logger.warning(f"   ⚠️  Error querying ExploitDB for {software}: {e}")
+            
+            if web_data:
+                enhanced = f"{context}\n\n## 🔥 Threat Intelligence (ExploitDB)\n" + "\n".join(web_data)
+                logger.info(f"✅ Enhanced context with threat intelligence for {len(web_data)} software versions")
+                return enhanced
+            
+        except ImportError as e:
+            logger.warning(f"⚠️  Could not import threat intelligence clients: {e}")
+        except Exception as e:
+            logger.error(f"❌ Error enhancing with software intel: {e}")
+        
+        return context
+    
     def query(
         self,
         user_input: str,
@@ -356,15 +506,22 @@ class RAGChatbot:
             Dict with response, sources, and metadata
         """
         try:
+            logger.info(f"🔵 Query started - session_id: {session_id}, query_length: {len(user_input)}")
+            
             # Get or create session
             if session_id:
                 session = self.get_session(session_id)
+                if not session:
+                    # Session expired or not found - create new with same ID
+                    logger.info(f"⚠️ Session {session_id} not found, creating new session with same ID")
+                    session = ChatSession(session_id=session_id)
+                else:
+                    logger.info(f"✅ Session {session_id} found with {len(session.messages)} messages")
             else:
-                session = None
-            
-            if not session:
+                # No session_id provided - create new one
                 session_id = f"session_{datetime.utcnow().timestamp()}"
                 session = ChatSession(session_id=session_id)
+                logger.info(f"🆕 Created new session: {session_id}")
             
             # 🆕 Step 0: Detect and load scan ID if present
             scan_data = None
@@ -440,6 +597,7 @@ class RAGChatbot:
             
             # ✨ NEW: Enhance context with real-time web data if CVEs detected
             logger.info(f"🔍 Checking for CVEs in query: '{user_input[:100]}'")
+            logger.debug(f"📝 Context preview (first 500 chars): {context[:500]}")
             context, web_enhanced = self._enhance_context_with_web(user_input, context, session)
             if web_enhanced:
                 logger.info("✅ Context enhanced with real-time web data!")
@@ -449,10 +607,14 @@ class RAGChatbot:
                 logger.info("ℹ️  No web enhancement applied")
             
             # Step 2: Build prompt with context and history
+            conversation_history = []
+            if session and hasattr(session, 'messages') and session.messages:
+                conversation_history = session.messages[-6:]  # Last 3 turns
+            
             prompt = self._build_prompt(
                 user_query=user_input,
                 context=context,
-                conversation_history=session.messages[-6:]  # Last 3 turns
+                conversation_history=conversation_history
             )
             
             # Step 3: Query LLM
@@ -510,7 +672,8 @@ class RAGChatbot:
             # Extract query intent safely
             try:
                 query_intent = retrieval_results.get('query_context', {}).intent if hasattr(retrieval_results.get('query_context', {}), 'intent') else 'unknown'
-            except:
+            except (AttributeError, KeyError) as e:
+                logger.debug(f"Failed to extract query intent: {e}")
                 query_intent = 'unknown'
             
             return {
@@ -532,12 +695,25 @@ class RAGChatbot:
         
         except Exception as e:
             logger.error(f"Error in query method: {e}", exc_info=True)
-            # Return fallback response
+            logger.error(f"Error type: {type(e).__name__}")
+            logger.error(f"Error details: session_id={session_id}, query_length={len(user_input) if user_input else 0}")
+            
+            # Return fallback response with detailed error info
+            error_message = str(e)
+            if "timeout" in error_message.lower():
+                response_text = "Request timeout - the query took too long. Please try a simpler question."
+            elif "connection" in error_message.lower():
+                response_text = "Connection error - unable to reach the AI service. Please check if Ollama is running."
+            elif "session" in error_message.lower():
+                response_text = "Session error - your conversation session may have expired. This response starts a new session."
+            else:
+                response_text = f"I encountered an error while processing your request. Error: {error_message[:100]}"
+            
             return {
-                'response': f"Error processing query: {str(e)}",
+                'response': response_text,
                 'sources': [],
                 'confidence': 0.0,
-                'session_id': session_id or 'unknown',
+                'session_id': session_id or f"session_{datetime.utcnow().timestamp()}",
                 'hallucination_detected': False,
                 'query_intent': 'error',
                 'docs_retrieved': 0,
@@ -943,69 +1119,57 @@ Remember: **Detail and accuracy are paramount**. Users need to understand the th
         """
         Post-process LLM response and detect hallucinations.
         
-        Hallucination = CVE mentioned in response but not in retrieved context
+        Enhanced hallucination detection (Issue IL3):
+        - CVE mentions not in scan context
+        - Port/service claims not in scan data
+        - Exploit availability claims without evidence
         
         Returns: (modified_response, hallucination_detected)
         """
         try:
-            # Extract CVE IDs mentioned in response
+            hallucinations = []
+            
+            # Check 1: CVE hallucinations
             mentioned_cves = set(re.findall(r'CVE-\d{4}-\d{4,}', llm_response, re.IGNORECASE))
             
-            if not mentioned_cves:
-                # No CVEs mentioned = no hallucination possible
-                return llm_response, False
+            if mentioned_cves:
+                context_cves = self._extract_context_cves(retrieval_results)
+                hallucinated_cves = mentioned_cves - context_cves
+                
+                if hallucinated_cves:
+                    cve_sample = ', '.join(sorted(list(hallucinated_cves))[:3])
+                    hallucinations.append(f"CVEs not in scan: {cve_sample}")
+                    logger.warning(f"Detected CVEs outside context: {cve_sample}")
             
-            # Safely extract CVEs from retrieval context
-            context_cves = set()
+            # Check 2: Port/service hallucinations (Issue IL3)
+            mentioned_ports = set(re.findall(r'port\s+(\d+)', llm_response, re.IGNORECASE))
             
-            try:
-                vuln_results = retrieval_results.get('vulnerability_results', {})
+            if mentioned_ports:
+                context_ports = self._extract_context_ports(retrieval_results)
+                hallucinated_ports = mentioned_ports - context_ports
                 
-                if not isinstance(vuln_results, dict):
-                    logger.warning(f"Unexpected vuln_results type: {type(vuln_results)}")
-                    # Return original response if we can't validate
-                    return llm_response, False
-                
-                metadatas = vuln_results.get('metadatas', [])
-                
-                if not isinstance(metadatas, list):
-                    logger.warning(f"Unexpected metadatas type: {type(metadatas)}")
-                    return llm_response, False
-                
-                # Extract CVE IDs from metadata safely
-                for item in metadatas:
-                    if isinstance(item, dict):
-                        cve_id = item.get('cve_id')
-                        if cve_id and isinstance(cve_id, str):
-                            context_cves.add(cve_id)
+                if hallucinated_ports and context_ports:  # Only flag if we have context
+                    port_sample = ', '.join(sorted(list(hallucinated_ports))[:5])
+                    hallucinations.append(f"Ports not in scan: {port_sample}")
+                    logger.warning(f"Detected ports outside context: {port_sample}")
             
-            except Exception as e:
-                logger.warning(f"Error extracting context CVEs: {e}")
-                # Safe fallback - assume no hallucination
-                return llm_response, False
+            # Check 3: Exploit availability claims (Issue IL3)
+            if re.search(r'exploit.*available|publicly.*exploit', llm_response, re.IGNORECASE):
+                if not self._verify_exploit_claims(retrieval_results):
+                    hallucinations.append("Unverified exploit availability claims")
+                    logger.warning("Detected unverified exploit claims")
             
-            # Detect hallucinated CVEs
-            hallucinated_cves = mentioned_cves - context_cves
-            
-            if hallucinated_cves:
-                # Add compact disclaimer about hallucinations
-                cve_sample = ', '.join(sorted(list(hallucinated_cves))[:3])
-                
-                logger.warning(f"Detected CVEs outside context: {cve_sample}")
-                
-                # Add subtle warning (moved to end, compact format)
+            # Add disclaimer if hallucinations detected
+            if hallucinations:
                 disclaimer = (
-                    f"\n\nNote: Some CVE references may be from general knowledge, "
-                    f"not your scanned data. Verify before acting: {cve_sample}"
+                    f"\n\n⚠️ Note: Some information may require verification: "
+                    f"{'; '.join(hallucinations)}"
                 )
-                
                 llm_response += disclaimer
-                
-                # Clean markdown formatting
                 llm_response = self._clean_markdown_formatting(llm_response)
                 return llm_response, True
             
-            # All mentioned CVEs are in context - clean and return
+            # No hallucinations - clean and return
             llm_response = self._clean_markdown_formatting(llm_response)
             return llm_response, False
         
@@ -1013,6 +1177,87 @@ Remember: **Detail and accuracy are paramount**. Users need to understand the th
             logger.error(f"Hallucination detection failed: {e}")
             # On error, return original response (safer than false positives)
             return llm_response, False
+    
+    def _extract_context_cves(self, retrieval_results: Dict) -> set:
+        """Extract CVE IDs from retrieval context (Issue IL3)"""
+        context_cves = set()
+        
+        try:
+            vuln_results = retrieval_results.get('vulnerability_results', {})
+            
+            if not isinstance(vuln_results, dict):
+                return context_cves
+            
+            metadatas = vuln_results.get('metadatas', [])
+            
+            if not isinstance(metadatas, list):
+                return context_cves
+            
+            # Extract CVE IDs from metadata
+            for item in metadatas:
+                if isinstance(item, dict):
+                    cve_id = item.get('cve_id')
+                    if cve_id and isinstance(cve_id, str):
+                        context_cves.add(cve_id)
+        
+        except Exception as e:
+            logger.warning(f"Error extracting context CVEs: {e}")
+        
+        return context_cves
+    
+    def _extract_context_ports(self, retrieval_results: Dict) -> set:
+        """Extract port numbers from retrieval context (Issue IL3)"""
+        context_ports = set()
+        
+        try:
+            vuln_results = retrieval_results.get('vulnerability_results', {})
+            
+            if not isinstance(vuln_results, dict):
+                return context_ports
+            
+            documents = vuln_results.get('documents', [])
+            
+            if not isinstance(documents, list):
+                return context_ports
+            
+            # Extract port numbers from vulnerability documents
+            for doc in documents:
+                if isinstance(doc, str):
+                    # Look for port patterns: "port 80", "port 443", etc.
+                    ports = re.findall(r'port\s+(\d+)', doc, re.IGNORECASE)
+                    context_ports.update(ports)
+        
+        except Exception as e:
+            logger.warning(f"Error extracting context ports: {e}")
+        
+        return context_ports
+    
+    def _verify_exploit_claims(self, retrieval_results: Dict) -> bool:
+        """Verify exploit availability claims against context (Issue IL3)"""
+        try:
+            # Check if exploit data exists in context
+            vuln_results = retrieval_results.get('vulnerability_results', {})
+            
+            if not isinstance(vuln_results, dict):
+                return False
+            
+            documents = vuln_results.get('documents', [])
+            
+            if not isinstance(documents, list):
+                return False
+            
+            # Look for exploit mentions in retrieved documents
+            for doc in documents:
+                if isinstance(doc, str):
+                    if re.search(r'exploit|exploitdb|metasploit|poc', doc, re.IGNORECASE):
+                        return True  # Exploit mention found in context
+            
+            # No exploit mentions in context
+            return False
+        
+        except Exception as e:
+            logger.warning(f"Error verifying exploit claims: {e}")
+            return False  # Assume unverified on error
     
     def _format_citations(self, response: str) -> str:
         """Format CVE IDs as clickable links"""
@@ -1229,8 +1474,11 @@ Remember: **Detail and accuracy are paramount**. Users need to understand the th
             except Exception as e:
                 logger.error(f"Error retrieving session from Redis: {e}")
         
-        # Fallback to in-memory
-        return self.sessions.get(session_id) if hasattr(self, 'sessions') else None
+        # Fallback to in-memory with thread safety
+        if hasattr(self, 'sessions'):
+            with self._sessions_lock:
+                return self.sessions.get(session_id)
+        return None
     
     def _save_session(self, session: ChatSession) -> None:
         """Save session to storage"""
@@ -1257,9 +1505,10 @@ Remember: **Detail and accuracy are paramount**. Users need to understand the th
             except Exception as e:
                 logger.error(f"Error saving session to Redis: {e}")
         else:
-            # In-memory fallback
+            # In-memory fallback with thread safety
             if hasattr(self, 'sessions'):
-                self.sessions[session.session_id] = session
+                with self._sessions_lock:
+                    self.sessions[session.session_id] = session
     
     def clear_session(self, session_id: str) -> bool:
         """Clear conversation history for session"""
@@ -1271,9 +1520,11 @@ Remember: **Detail and accuracy are paramount**. Users need to understand the th
                 logger.error(f"Error deleting session from Redis: {e}")
                 return False
         else:
-            if hasattr(self, 'sessions') and session_id in self.sessions:
-                del self.sessions[session_id]
-                return True
+            if hasattr(self, 'sessions'):
+                with self._sessions_lock:
+                    if session_id in self.sessions:
+                        del self.sessions[session_id]
+                        return True
         return False
 
 

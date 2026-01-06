@@ -70,7 +70,7 @@ def check_model_availability(model_name: str) -> bool:
         True if model is available, False otherwise
     """
     try:
-        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags")
+        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
         if response.status_code == 200:
             models = response.json().get('models', [])
             available_models = [m['name'] for m in models]
@@ -237,6 +237,13 @@ Be concise and always cite sources (CVE IDs, tool names) when possible."""
     
     conversation_history = []
     
+    # Interactive loop for CLI demo (Issue Q4 - Intentional Design)
+    # This while True loop is INTENTIONAL for interactive CLI chat.
+    # Exit conditions:
+    #   1. User types 'exit', 'quit', or 'q' (line 247)
+    #   2. KeyboardInterrupt (Ctrl+C) caught below (line 280)
+    #   3. EOFError (Ctrl+D on Unix) caught below (line 282)
+    # NOT an infinite loop bug - this is standard CLI REPL pattern.
     while True:
         try:
             user_input = input(f"{Colors.OKCYAN}You: {Colors.ENDC}")

@@ -22,9 +22,12 @@ Tool-Specific Conversion:
 
 import re
 import ipaddress
+import logging
 from typing import Dict, Optional, Tuple, List
 from urllib.parse import urlparse, urlunparse
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -166,7 +169,11 @@ class UniversalTargetParser:
                 nuclei_format=clean_url,  # Nuclei: keep full URL
                 openvas_format=hostname  # OpenVAS: strip URL, use hostname
             )
-        except Exception:
+        except (ValueError, TypeError) as e:
+            logger.debug(f"URL parsing failed for '{target}': {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Unexpected error parsing URL '{target}': {e}", exc_info=True)
             return None
     
     @staticmethod
@@ -213,7 +220,8 @@ class UniversalTargetParser:
                     nuclei_format=f"http://[{network.network_address}]",
                     openvas_format=str(network.network_address)
                 )
-            except Exception:
+            except (ValueError, ipaddress.AddressValueError, ipaddress.NetmaskValueError) as e:
+                logger.debug(f"IPv6 CIDR parsing failed for '{target}': {e}")
                 pass
         
         # Check for plain IPv6
@@ -235,7 +243,8 @@ class UniversalTargetParser:
                     nuclei_format=f"http://[{target}]",
                     openvas_format=target
                 )
-            except Exception:
+            except (ValueError, ipaddress.AddressValueError) as e:
+                logger.debug(f"IPv6 address parsing failed for '{target}': {e}")
                 pass
         
         return None
@@ -261,7 +270,8 @@ class UniversalTargetParser:
                 nuclei_format=f"http://{network.network_address}",
                 openvas_format=str(network.network_address)
             )
-        except Exception:
+        except (ValueError, ipaddress.AddressValueError, ipaddress.NetmaskValueError) as e:
+            logger.debug(f"IPv4 CIDR parsing failed for '{target}': {e}")
             pass
         
         try:
@@ -282,7 +292,8 @@ class UniversalTargetParser:
                 nuclei_format=f"http://[{network.network_address}]",
                 openvas_format=str(network.network_address)
             )
-        except Exception:
+        except (ValueError, ipaddress.AddressValueError, ipaddress.NetmaskValueError) as e:
+            logger.debug(f"IPv6 CIDR parsing failed for '{target}': {e}")
             pass
         
         return None

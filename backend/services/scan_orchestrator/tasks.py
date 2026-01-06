@@ -244,10 +244,70 @@ def execute_scan(
         # 🔥 WebSocket: Emit progress 30% (Phase 2, Day 2)
         emit_scan_progress(scan_id, 30, f"Executing {tool} scan on {target}...")
 
-        # Execute scan
-        result = adapter.execute_scan(
-            target=target, scan_type=scan_type, options=options
-        )
+        # For long-running scans, emit periodic progress updates
+        import threading
+        import time
+        
+        progress_stop_event = threading.Event()
+        current_progress = [30]  # Mutable to share between threads
+        
+        def emit_periodic_progress():
+            """Emit progress updates every 30 seconds during scan execution"""
+            iteration = 0
+            while not progress_stop_event.is_set():
+                iteration += 1
+                
+                # Wait 30 seconds or until stop event
+                if progress_stop_event.wait(timeout=30):
+                    break
+                
+                # Gradual progress increase (caps at 65% to leave room for post-processing)
+                # Slower increment as we get higher to avoid misleading users
+                if current_progress[0] < 40:
+                    increment = 5
+                elif current_progress[0] < 50:
+                    increment = 3
+                elif current_progress[0] < 60:
+                    increment = 2
+                else:
+                    increment = 1
+                
+                current_progress[0] = min(current_progress[0] + increment, 65)
+                
+                # Time-based message
+                elapsed_minutes = iteration * 0.5  # 30s = 0.5 min
+                
+                if elapsed_minutes < 2:
+                    status_msg = f"{tool} scan in progress..."
+                elif elapsed_minutes < 5:
+                    status_msg = f"{tool} scan running... (scanning in depth)"
+                elif elapsed_minutes < 15:
+                    status_msg = f"{tool} scan running... ({elapsed_minutes:.0f} min elapsed)"
+                else:
+                    status_msg = f"{tool} scan running... ({elapsed_minutes:.0f} min - large target, please wait)"
+                
+                # Update database with progress
+                ingestor.update_scan_progress(scan_id, current_progress[0], status_msg)
+                
+                # Emit WebSocket event
+                emit_scan_progress(scan_id, current_progress[0], status_msg)
+                logger.info(f"📊 Progress update: {current_progress[0]}% ({elapsed_minutes:.1f} min elapsed)")
+        
+        # Start progress thread for all scans (provides real-time feedback)
+        progress_thread = threading.Thread(target=emit_periodic_progress, daemon=True)
+        progress_thread.start()
+        logger.info("🕐 Started real-time progress monitoring")
+
+        try:
+            # Execute scan
+            result = adapter.execute_scan(
+                target=target, scan_type=scan_type, options=options
+            )
+        finally:
+            # Stop progress thread
+            progress_stop_event.set()
+            progress_thread.join(timeout=2)
+            logger.info("✅ Progress monitoring stopped")
 
         # 🔥 WebSocket: Emit progress 70% (Phase 2, Day 2)
         emit_scan_progress(scan_id, 70, "Scan completed, processing results...")
@@ -632,6 +692,9 @@ def execute_scan(
             job.meta["status"] = "completed"
             job.meta["progress"] = 100
             job.save_meta()
+
+        # Update database with 100% progress
+        ingestor.update_scan_progress(scan_id, 100, "Scan completed successfully!")
 
         # 🔥 WebSocket: Emit progress 100% (Phase 2, Day 2)
         emit_scan_progress(scan_id, 100, "Scan completed successfully!")

@@ -10,7 +10,18 @@ Date: 2025-10-22
 
 import json
 import logging
-import xml.etree.ElementTree as ET
+# Use defusedxml when available to mitigate XML vulnerabilities
+try:
+    from defusedxml import ElementTree as ET
+    try:
+        # Harden stdlib XML parsers when defusedxml is installed
+        from defusedxml import defuse_stdlib
+        defuse_stdlib()
+    except Exception:
+        pass
+except Exception:
+    import xml.etree.ElementTree as ET
+
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 

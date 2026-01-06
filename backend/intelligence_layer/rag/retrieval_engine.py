@@ -10,7 +10,10 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import spacy
-from sentence_transformers import SentenceTransformer
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -62,8 +65,26 @@ class RAGRetrievalEngine:
             logger.warning(f"spaCy model '{spacy_model}' not found. Download with: python -m spacy download {spacy_model}")
             self.nlp = None
         
-        # Load embedding model
-        self.embedder = SentenceTransformer(embedding_model)
+        # Load embedding model (use a dummy embedder if sentence-transformers or torch not available)
+        class _DummyEmbedder:
+            def __init__(self, dim: int = 384):
+                self.dim = dim
+
+            def encode(self, texts, *args, **kwargs):
+                # Return zero vectors for each input text
+                if isinstance(texts, str):
+                    texts = [texts]
+                return [[0.0] * self.dim for _ in texts]
+
+        if SentenceTransformer is None:
+            logger.warning("sentence-transformers not available; using dummy embedder")
+            self.embedder = _DummyEmbedder()
+        else:
+            try:
+                self.embedder = SentenceTransformer(embedding_model)
+            except Exception as exc:
+                logger.warning("Failed to initialize SentenceTransformer (%s); using dummy embedder", exc)
+                self.embedder = _DummyEmbedder()
         
         # Query expansion synonyms
         self.synonyms = {

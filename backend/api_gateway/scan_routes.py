@@ -19,6 +19,7 @@ from flask_restx import Namespace, Resource, fields
 from markupsafe import escape
 from werkzeug.exceptions import BadRequest, NotFound
 import requests
+from sqlalchemy.exc import SQLAlchemyError
 
 from config.config import get_config
 from services.data_ingestor.ingestor import DataIngestor
@@ -246,19 +247,28 @@ class ScanList(Resource):
     def get(self):
         """List all scans with optional filtering"""
         try:
-            # Get query parameters
+            from utils.validation import validate_pagination, validate_status
+            
+            # Get and validate query parameters
             status_param = request.args.get('status')
             tool_name = request.args.get('tool_name')
-            page = int(request.args.get('page', 1))
-            per_page = int(request.args.get('per_page', 20))
+            
+            # Validate pagination
+            try:
+                page = int(request.args.get('page', 1))
+                per_page = int(request.args.get('per_page', 20))
+                page, per_page = validate_pagination(page, per_page)
+            except (ValueError, TypeError) as e:
+                raise BadRequest(f"Invalid pagination parameters: {e}")
 
             # Convert status string to enum
             status = None
             if status_param:
                 try:
-                    status = ScanStatus[status_param.upper()]
-                except KeyError:
-                    raise BadRequest(f"Invalid status: {status_param}")
+                    validated_status = validate_status(status_param)
+                    status = ScanStatus[validated_status]
+                except (KeyError, ValueError) as e:
+                    raise BadRequest(f"Invalid status: {e}")
 
             # Get scans
             scans, total = ingestor.list_scans(
@@ -293,9 +303,21 @@ class ScanList(Resource):
 
         except BadRequest:
             raise
-        except (KeyError, TypeError, ValueError) as e:
-            logger.error("Error listing scans: %s", type(e).__name__)
-            scans_ns.abort(500, "Failed to list scans")
+        except KeyError as e:
+            logger.error(f"Missing required data field: {str(e)}", exc_info=True)
+            scans_ns.abort(500, f"Internal error: missing data field {str(e)}")
+        except TypeError as e:
+            logger.error(f"Type validation failed: {str(e)}", exc_info=True)
+            scans_ns.abort(500, f"Internal error: invalid data type")
+        except ValueError as e:
+            logger.error(f"Value validation failed: {str(e)}", exc_info=True)
+            scans_ns.abort(500, f"Internal error: invalid value")
+        except SQLAlchemyError as e:
+            logger.error(f"Database error in list_scans: {str(e)}", exc_info=True)
+            scans_ns.abort(500, "Database operation failed")
+        except Exception as e:
+            logger.error(f"Unexpected error listing scans: {str(e)}", exc_info=True)
+            scans_ns.abort(500, "An unexpected error occurred")
 
     @scans_ns.doc('create_scan')
     @scans_ns.expect(scan_request_model, validate=True)
@@ -343,6 +365,11 @@ class ScanList(Resource):
                     priority=data.get('priority', 'normal')
                 )
                 logger.info(f"✅ Successfully enqueued scan {scan_id} with job_id {job_id}")
+                
+                # Update scan status to QUEUED (valid transition: PENDING → QUEUED)
+                ingestor.update_scan_status(scan_id=scan_id, status=ScanStatus.QUEUED)
+                logger.info(f"✅ Scan {scan_id} status updated to QUEUED")
+                
             except Exception as enqueue_error:
                 logger.error("❌ Failed to enqueue scan %s: %s", scan_id, str(enqueue_error), exc_info=True)
                 # Update scan to failed status
@@ -357,15 +384,13 @@ class ScanList(Resource):
                     'suggestion': 'Ensure Redis and RQ worker are running. Check logs for details.'
                 }, 500
 
-            # Update the scan with job_id and status
+            # Update the scan with job_id
             session = ingestor.get_session()
             try:
                 from services.data_ingestor.models import Scan
                 scan_obj = session.query(Scan).filter(
                     Scan.id == scan_id).first()
                 if scan_obj:
-                    # Set to PENDING (queued status)
-                    scan_obj.status = ScanStatus.PENDING
                     scan_obj.job_id = job_id
                     session.commit()
             finally:
@@ -403,6 +428,14 @@ class Scan(Resource):
     def get(self, scan_id):
         """Get detailed scan information"""
         try:
+            from utils.validation import validate_scan_id
+            
+            # Validate scan ID format
+            try:
+                scan_id = validate_scan_id(scan_id)
+            except ValueError as e:
+                raise BadRequest(str(e))
+            
             scan = ingestor.get_scan(scan_id)
         except (KeyError, ValueError, AttributeError):
             # If any error occurs during lookup, treat as not found
@@ -479,8 +512,21 @@ class Scan(Resource):
 
             return jsonify(final_response)
 
+        except NotFound:
+            raise
+        except BadRequest:
+            raise
+        except AttributeError as e:
+            logger.error(f"Missing attribute in scan data: {str(e)}", exc_info=True)
+            scans_ns.abort(500, "Internal error: invalid scan data structure")
+        except TypeError as e:
+            logger.error(f"Type error processing scan data: {str(e)}", exc_info=True)
+            scans_ns.abort(500, "Internal error: data type mismatch")
+        except SQLAlchemyError as e:
+            logger.error(f"Database error getting scan {scan_id}: {str(e)}", exc_info=True)
+            scans_ns.abort(500, "Database operation failed")
         except Exception as e:
-            logger.error("Error getting scan: %s - %s", type(e).__name__, str(e), exc_info=True)
+            logger.error(f"Unexpected error getting scan {scan_id}: {str(e)}", exc_info=True)
             scans_ns.abort(500, "Failed to get scan")
 
     @scans_ns.doc('delete_scan')
@@ -505,8 +551,124 @@ class Scan(Resource):
 
         except NotFound:
             raise
+        except AttributeError as e:
+            logger.error(f"Invalid scan data structure: {str(e)}", exc_info=True)
+            scans_ns.abort(500, "Internal error: invalid scan data")
+        except SQLAlchemyError as e:
+            logger.error(f"Database error deleting scan {scan_id}: {str(e)}", exc_info=True)
+            scans_ns.abort(500, "Database operation failed")
         except Exception as e:
+            logger.error(f"Unexpected error deleting scan {scan_id}: {str(e)}", exc_info=True)
             scans_ns.abort(500, f"Failed to delete scan: {str(e)}")
+
+
+@scans_ns.route('/<string:scan_id>/retry')
+@scans_ns.param('scan_id', 'The scan identifier')
+class ScanRetryResource(Resource):
+    """Scan retry endpoint for failed scans"""
+
+    @scans_ns.doc('retry_scan')
+    @scans_ns.response(200, 'Scan retry successful', scan_detail_model)
+    @scans_ns.response(400, 'Cannot retry scan in current status')
+    @scans_ns.response(404, 'Scan not found')
+    def post(self, scan_id):
+        """Retry a failed scan"""
+        try:
+            from utils.validation import validate_scan_id
+            
+            # Validate scan ID format
+            try:
+                scan_id = validate_scan_id(scan_id)
+            except ValueError as e:
+                raise BadRequest(str(e))
+            
+            scan = ingestor.get_scan(scan_id)
+            if not scan:
+                raise NotFound(f"Scan {scan_id} not found")
+
+            # Only allow retry for failed scans
+            if scan.status != ScanStatus.FAILED:
+                scans_ns.abort(400, f"Cannot retry scan with status '{scan.status.value}'. Only failed scans can be retried.")
+
+            logger.info(f"🔄 Retrying failed scan {scan_id}")
+            logger.info(f"📋 Original scan options: {scan.options}")
+
+            # Re-enqueue the scan with updated configuration
+            # Remove old timeout from options so it uses new adapter defaults
+            retry_options = scan.options.copy() if scan.options else {}
+            removed_keys = []
+            if 'timeout' in retry_options:
+                old_timeout = retry_options.pop('timeout')
+                removed_keys.append(f'timeout={old_timeout}s')
+            if 'per_test_timeout' in retry_options:
+                old_per_test = retry_options.pop('per_test_timeout')
+                removed_keys.append(f'per_test_timeout={old_per_test}s')
+            
+            logger.info(f"📋 Cleaned retry options: {retry_options}")
+            if removed_keys:
+                logger.info(f"Removing old timeout settings: {', '.join(removed_keys)} - will use adapter defaults")
+            
+            # Update the scan's stored options in database to remove old timeouts
+            session = ingestor.get_session()
+            try:
+                db_scan = session.query(ingestor.scan_class).filter_by(id=scan_id).first()
+                if db_scan:
+                    db_scan.options = retry_options
+                    session.commit()
+                    logger.info(f"✅ Updated scan options in database (removed timeout settings)")
+            finally:
+                session.close()
+            
+            # Clear error message and reset status to PENDING first (state machine requirement)
+            ingestor.update_scan_status(
+                scan_id=scan_id,
+                status=ScanStatus.PENDING,
+                error_message=None
+            )
+            
+            job_id = orchestrator.enqueue_scan(
+                scan_id=str(scan.id),
+                target=scan.target,
+                tool=scan.tool_name,
+                scan_type=scan.scan_type,
+                options=retry_options
+            )
+
+            # Update to QUEUED status and job ID
+            ingestor.update_scan_status(
+                scan_id=scan_id,
+                status=ScanStatus.QUEUED
+            )
+            
+            # Update job ID
+            session = ingestor.get_session()
+            try:
+                db_scan = session.query(ingestor.scan_class).filter_by(id=scan_id).first()
+                if db_scan:
+                    db_scan.job_id = job_id
+                    session.commit()
+            finally:
+                session.close()
+
+            logger.info(f"✅ Scan {scan_id} re-queued successfully with job {job_id} (using adapter default timeouts)")
+
+            # Return updated scan
+            updated_scan = ingestor.get_scan(scan_id)
+            return updated_scan.to_dict(), 200
+
+        except NotFound:
+            raise
+        except BadRequest:
+            raise
+        except AttributeError as e:
+            logger.error(f"Invalid scan data structure: {str(e)}", exc_info=True)
+            scans_ns.abort(500, "Internal error: invalid scan data")
+        except SQLAlchemyError as e:
+            logger.error(f"Database error retrying scan {scan_id}: {str(e)}", exc_info=True)
+            scans_ns.abort(500, "Database operation failed")
+        except Exception as e:
+            logger.error(f"Unexpected error retrying scan {scan_id}: {str(e)}", exc_info=True)
+            scans_ns.abort(500, f"Failed to retry scan: {str(e)}")
 
 
 @scans_ns.route('/<string:scan_id>/status')
@@ -519,6 +681,14 @@ class ScanStatusResource(Resource):
     def get(self, scan_id):
         """Get current scan status"""
         try:
+            from utils.validation import validate_scan_id
+            
+            # Validate scan ID format
+            try:
+                scan_id = validate_scan_id(scan_id)
+            except ValueError as e:
+                raise BadRequest(str(e))
+            
             scan = ingestor.get_scan(scan_id)
 
             if not scan:
@@ -602,11 +772,13 @@ class ScanRawResults(Resource):
                                         else:
                                             wrapped_lines.append(json_line)
                                     formatted_lines.append('\n'.join(wrapped_lines))
-                                except:
+                                except (json.JSONDecodeError, ValueError, AttributeError) as e:
+                                    logger.debug(f"JSON formatting failed: {e}")
                                     formatted_lines.append(line)
                         formatted_output = '\n'.join(formatted_lines)
-                    except:
+                    except (json.JSONDecodeError, ValueError, TypeError) as e:
                         # If formatting fails, use original output
+                        logger.debug(f"Output formatting failed: {e}")
                         pass
                 
                 result_list.append({
@@ -693,12 +865,14 @@ class ScanParsedResults(Resource):
                     ollama_health = check_ollama_health(timeout=10)
                     
                     if not ollama_health['available']:
-                        # Ollama is unavailable - RETRY ONCE after 2 second delay
+                        # Ollama is unavailable - RETRY ONCE after brief delay
+                        # Ollama may need 1-2 seconds to warm up model on first request
+                        OLLAMA_RETRY_DELAY_SECONDS = 2
                         logger.warning(f"Ollama unavailable for scan {scan_id}: {ollama_health['error']}")
-                        logger.info("Retrying Ollama health check after 2 second delay (may be warming up)...")
+                        logger.info(f"Retrying Ollama health check after {OLLAMA_RETRY_DELAY_SECONDS}s delay (may be warming up)...")
                         
                         import time
-                        time.sleep(2)
+                        time.sleep(OLLAMA_RETRY_DELAY_SECONDS)
                         
                         # Retry health check
                         ollama_health_retry = check_ollama_health(timeout=10)
@@ -761,7 +935,8 @@ class ScanParsedResults(Resource):
                                 try:
                                     parsed = urlparse(host)
                                     host = parsed.netloc or parsed.hostname or host
-                                except:
+                                except (ValueError, AttributeError) as e:
+                                    logger.debug(f"URL parsing failed for host {host}: {e}")
                                     pass
                             
                             vuln_obj = Vulnerability(
@@ -1154,7 +1329,8 @@ class RegenerateAISummary(Resource):
                     try:
                         parsed = urlparse(host)
                         host = parsed.netloc or parsed.hostname or host
-                    except:
+                    except (ValueError, AttributeError) as e:
+                        logger.debug(f"URL parsing failed for host {host}: {e}")
                         pass
                 
                 vuln_obj = Vulnerability(
@@ -1450,12 +1626,21 @@ class StatsResource(Resource):
     def get(self):
         """Get overall scan statistics"""
         try:
-            # Get all scans
+            # Get scans for statistics (limited to 10K for performance)
             all_scans, total_count = ingestor.list_scans(limit=10000, offset=0)
+            
+            # Safety check: Warn if approaching limit
+            if total_count > 9500:
+                logger.warning(
+                    "Statistics may be incomplete: %d total scans, only processing first 10,000. "
+                    "Consider implementing database aggregation for statistics at scale.",
+                    total_count
+                )
 
             # Calculate statistics
             stats = {
                 'total_scans': total_count,
+                'stats_based_on': len(all_scans),  # Indicate sampling if limited
                 'status_breakdown': {
                     'pending': 0,
                     'queued': 0,
@@ -1494,19 +1679,29 @@ class StatsResource(Resource):
                     stats['scan_type_usage'][scan.scan_type] = stats['scan_type_usage'].get(
                         scan.scan_type, 0) + 1
 
-            # Get vulnerability summary
+            # Get vulnerability summary using SQL aggregation (Issue P2 - Unbounded query fix)
             try:
                 session = ingestor.get_session()
                 from services.data_ingestor.models import ScanSummary
-                summaries = session.query(ScanSummary).all()
-
-                for summary in summaries:
-                    stats['vulnerabilities']['total'] += summary.total_vulnerabilities or 0
-                    stats['vulnerabilities']['critical'] += summary.critical_count or 0
-                    stats['vulnerabilities']['high'] += summary.high_count or 0
-                    stats['vulnerabilities']['medium'] += summary.medium_count or 0
-                    stats['vulnerabilities']['low'] += summary.low_count or 0
-                    stats['vulnerabilities']['info'] += summary.info_count or 0
+                from sqlalchemy import func
+                
+                # Use SQL aggregation instead of loading all records
+                result = session.query(
+                    func.sum(ScanSummary.total_vulnerabilities).label('total'),
+                    func.sum(ScanSummary.critical_count).label('critical'),
+                    func.sum(ScanSummary.high_count).label('high'),
+                    func.sum(ScanSummary.medium_count).label('medium'),
+                    func.sum(ScanSummary.low_count).label('low'),
+                    func.sum(ScanSummary.info_count).label('info')
+                ).first()
+                
+                if result:
+                    stats['vulnerabilities']['total'] += result.total or 0
+                    stats['vulnerabilities']['critical'] += result.critical or 0
+                    stats['vulnerabilities']['high'] += result.high or 0
+                    stats['vulnerabilities']['medium'] += result.medium or 0
+                    stats['vulnerabilities']['low'] += result.low or 0
+                    stats['vulnerabilities']['info'] += result.info or 0
 
                 session.close()
             except Exception as e:
@@ -1587,19 +1782,29 @@ class StatsSummary(Resource):
                     stats['scan_type_usage'][scan.scan_type] = stats['scan_type_usage'].get(
                         scan.scan_type, 0) + 1
 
-            # Get vulnerability summary
+            # Get vulnerability summary using SQL aggregation (Issue P2 - Unbounded query fix)
             try:
                 session = ingestor.get_session()
                 from services.data_ingestor.models import ScanSummary
-                summaries = session.query(ScanSummary).all()
-
-                for summary in summaries:
-                    stats['vulnerabilities']['total'] += summary.vulnerabilities_found or 0
-                    stats['vulnerabilities']['critical'] += summary.critical_count or 0
-                    stats['vulnerabilities']['high'] += summary.high_count or 0
-                    stats['vulnerabilities']['medium'] += summary.medium_count or 0
-                    stats['vulnerabilities']['low'] += summary.low_count or 0
-                    stats['vulnerabilities']['info'] += summary.info_count or 0
+                from sqlalchemy import func
+                
+                # Use SQL aggregation instead of loading all records
+                result = session.query(
+                    func.sum(ScanSummary.vulnerabilities_found).label('total'),
+                    func.sum(ScanSummary.critical_count).label('critical'),
+                    func.sum(ScanSummary.high_count).label('high'),
+                    func.sum(ScanSummary.medium_count).label('medium'),
+                    func.sum(ScanSummary.low_count).label('low'),
+                    func.sum(ScanSummary.info_count).label('info')
+                ).first()
+                
+                if result:
+                    stats['vulnerabilities']['total'] += result.total or 0
+                    stats['vulnerabilities']['critical'] += result.critical or 0
+                    stats['vulnerabilities']['high'] += result.high or 0
+                    stats['vulnerabilities']['medium'] += result.medium or 0
+                    stats['vulnerabilities']['low'] += result.low or 0
+                    stats['vulnerabilities']['info'] += result.info or 0
 
                 session.close()
             except Exception as e:

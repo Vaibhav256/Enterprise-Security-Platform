@@ -10,6 +10,7 @@ Real-time integration with NVD API for continuous threat intelligence updates.
 import os
 import requests
 import time
+import threading
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 import logging
@@ -44,16 +45,42 @@ class NVDClient:
         else:
             logger.info("NVD client initialized without API key (5 req/30s)")
         
-        # Rate limiting
+        # Rate limiting with thread safety
+        self.rate_limit_lock = threading.Lock()
         self.last_request_time = 0
         self.min_request_interval = 0.6 if self.api_key else 6  # seconds
+        self.max_sleep_time = 30  # Maximum sleep duration (prevent infinite sleep)
     
     def _rate_limit(self):
-        """Enforce rate limiting."""
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.min_request_interval:
-            time.sleep(self.min_request_interval - elapsed)
-        self.last_request_time = time.time()
+        """
+        Enforce rate limiting with thread safety and clock skew protection.
+        
+        Thread Safety: Uses lock to safely access and modify rate limit state
+        Clock Skew: Detects negative elapsed time and resets
+        Infinite Sleep: Clamps sleep time to max_sleep_time
+        """
+        with self.rate_limit_lock:
+            current_time = time.time()
+            elapsed = current_time - self.last_request_time
+            
+            # Protect against negative elapsed time (clock skew, time adjustment)
+            if elapsed < 0:
+                logger.warning(
+                    f"Negative elapsed time detected ({elapsed:.2f}s), possible clock skew. Resetting rate limit state."
+                )
+                self.last_request_time = current_time
+                return
+            
+            if elapsed < self.min_request_interval:
+                sleep_time = self.min_request_interval - elapsed
+                
+                # Clamp sleep time to reasonable maximum (prevent infinite sleep)
+                sleep_time = min(sleep_time, self.max_sleep_time)
+                
+                logger.debug(f"Rate limiting: sleeping {sleep_time:.2f}s")
+                time.sleep(sleep_time)
+            
+            self.last_request_time = time.time()
     
     def get_cve(self, cve_id: str) -> Optional[Dict[str, Any]]:
         """

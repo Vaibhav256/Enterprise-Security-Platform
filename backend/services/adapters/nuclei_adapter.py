@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from services.adapters.base_adapter import BaseAdapter
 from utils.wsl_helper import WSLHelper
@@ -102,12 +102,19 @@ class NucleiAdapter(BaseAdapter):
             "debug": False,
         }
 
+    def get_default_timeout(self) -> int:
+        """
+        Dynamic timeout for template-based scanning
+        Scans run until natural completion (safety limit: 4 hours)
+        """
+        return 14400  # 4 hours - template scans can be extensive
+
     def build_command(
         self,
         target: str,
         scan_type: str = "basic",
         options: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> List[str]:
         """
         Build Nuclei command using safe array-based construction
 
@@ -117,7 +124,7 @@ class NucleiAdapter(BaseAdapter):
             options: Additional options
 
         Returns:
-            Nuclei command string
+            WSL command array (e.g., ['wsl.exe', '-d', 'kali-linux', '--', 'nuclei', ...])
         """
         if not self.validate_target(target):
             raise ValueError(f"Invalid target: {target}")
@@ -222,17 +229,11 @@ class NucleiAdapter(BaseAdapter):
                 tool="nuclei",
                 tool_args=cmd_parts[1:]  # Skip 'nuclei' as it's added by build_wsl_command
             )
-            # Convert array to shell command string (safe because array is pre-validated)
-            import shlex
-            command = ' '.join(shlex.quote(arg) for arg in wsl_cmd)
-            logger.info("Built Nuclei command (validated)")
-            return command
+            logger.info("Built Nuclei WSL command array (validated)")
+            return wsl_cmd
         except ValueError as e:
             logger.error("Command validation failed: %s", str(e))
             raise
-        logger.info("Built Nuclei command: %s", command)
-
-        return command
 
     def execute_scan(  # type: ignore[override]
         self,
@@ -276,10 +277,16 @@ class NucleiAdapter(BaseAdapter):
         )
         end_time = datetime.now()
         execution_time = (end_time - start_time).total_seconds()
+        
+        # Check if scan timed out (return_code=-1 indicates timeout)
+        timed_out = (result.return_code == -1)
+        if timed_out:
+            logger.warning(f"⚠️ Nuclei scan timed out after {timeout}s - saving partial results")
 
         # Nuclei returns 0 on success, 2 on no findings (which is still OK)
-        # Only treat it as error if stderr has actual error messages
-        if not result.success and result.return_code not in [0, 2]:
+        # Allow timeout (-1) to continue with partial results
+        # Only treat it as error if stderr has actual error messages and no output
+        if not result.success and result.return_code not in [0, 2, -1]:
             error_msg = f"Nuclei scan failed: {result.stderr}"
             logger.error(error_msg)
             return ScanResult(
@@ -291,27 +298,39 @@ class NucleiAdapter(BaseAdapter):
                 execution_time=execution_time,
             )
 
-        # Parse output
+        # Parse output (works even for partial/timeout results)
         try:
             parsed_data = self.parse_output(result.stdout)
         except Exception as e:
             logger.error("Failed to parse Nuclei output: %s", str(e))
             parsed_data = None
 
-        logger.info(
-            "Nuclei scan completed in %.2fs. Found %d findings",
-            execution_time,
-            len(parsed_data.get("findings", [])) if parsed_data else 0,
-        )
+        findings_count = len(parsed_data.get("findings", [])) if parsed_data else 0
+        
+        if timed_out:
+            logger.warning(
+                f"⚠️ Nuclei scan TIMED OUT after {timeout}s ({execution_time:.2f}s elapsed). "
+                f"Saved {findings_count} partial findings"
+            )
+        else:
+            logger.info(
+                "Nuclei scan completed in %.2fs. Found %d findings",
+                execution_time,
+                findings_count,
+            )
 
         return ScanResult(
-            success=True,
+            success=True,  # Consider timeout as "success with partial results"
             tool="nuclei",
             target=target,
             raw_output=result.stdout,
             parsed_output=parsed_data,
             execution_time=execution_time,
-            scan_metadata={"scan_type": scan_type},
+            scan_metadata={
+                "scan_type": scan_type,
+                "timed_out": timed_out,
+                "timeout_seconds": timeout if timed_out else None
+            },
         )
 
     def parse_results(self, raw_output: str) -> Dict[str, Any]:
@@ -346,17 +365,20 @@ class NucleiAdapter(BaseAdapter):
             try:
                 finding = json.loads(line)
 
-                # Extract key information
+                # Extract key information with safe navigation
+                info = finding.get("info") or {}
+                classification = info.get("classification") or {}
+                
                 parsed_finding = {
                     "template_id": finding.get("template-id"),
-                    "template_name": finding.get("info", {}).get("name"),
-                    "severity": str(finding.get("info", {}).get("severity") or "info").lower(),  # ✅ FIX: Handle None
-                    "description": finding.get("info", {}).get("description"),
-                    "tags": finding.get("info", {}).get("tags", []),
-                    "classification": finding.get("info", {}).get("classification", {}),
+                    "template_name": info.get("name"),
+                    "severity": str(info.get("severity") or "info").lower(),
+                    "description": info.get("description"),
+                    "tags": info.get("tags") or [],
+                    "classification": classification,
                     "matched_at": finding.get("matched-at"),
                     "matcher_name": finding.get("matcher-name"),
-                    "extracted_results": finding.get("extracted-results", []),
+                    "extracted_results": finding.get("extracted-results") or [],
                     "curl_command": finding.get("curl-command"),
                     "type": finding.get("type"),
                     "host": finding.get("host"),
@@ -365,16 +387,12 @@ class NucleiAdapter(BaseAdapter):
                 }
 
                 # Add CVE information if present
-                if "cve-id" in finding.get("info", {}).get("classification", {}):
-                    parsed_finding["cve_id"] = finding["info"]["classification"][
-                        "cve-id"
-                    ]
+                if "cve-id" in classification:
+                    parsed_finding["cve_id"] = classification["cve-id"]
 
                 # Add CWE information if present
-                if "cwe-id" in finding.get("info", {}).get("classification", {}):
-                    parsed_finding["cwe_id"] = finding["info"]["classification"][
-                        "cwe-id"
-                    ]
+                if "cwe-id" in classification:
+                    parsed_finding["cwe_id"] = classification["cwe-id"]
 
                 findings.append(parsed_finding)
 

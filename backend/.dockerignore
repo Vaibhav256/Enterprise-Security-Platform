@@ -1,0 +1,125 @@
+# =============================================================================
+# Docker Ignore File - Security & Optimization
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# SECURITY - Environment Variables & Secrets (CRITICAL)
+# -----------------------------------------------------------------------------
+.env*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+.secrets
+
+# -----------------------------------------------------------------------------
+# Testing & Development
+# -----------------------------------------------------------------------------
+tests/
+htmlcov/
+.coverage
+.coverage.*
+.pytest_cache/
+.tox/
+.nox/
+test-results/
+coverage.json
+*.test.py
+
+# Development tools
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# -----------------------------------------------------------------------------
+# Python Cache & Build
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+eval_venv/
+
+# -----------------------------------------------------------------------------
+# Database & Cache
+# -----------------------------------------------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+dump.rdb
+*.dump
+chroma_db/
+*.chroma
+scan_results/
+cache/
+
+# -----------------------------------------------------------------------------
+# Logs & Reports
+# -----------------------------------------------------------------------------
+logs/
+*.log
+debug_logs/
+reports/
+test_exports/
+
+# -----------------------------------------------------------------------------
+# Documentation
+# -----------------------------------------------------------------------------
+docs/
+*.md
+!README.md
+mds/
+htmlcov/
+
+# -----------------------------------------------------------------------------
+# OS Files
+# -----------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# -----------------------------------------------------------------------------
+# Temporary Files
+# -----------------------------------------------------------------------------
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+*.old
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Project files
+PROJECT_REPORT.md
+IMPROVEMENTS_AND_OPTIMIZATIONS.md
+DEPLOYMENT_READINESS_REPORT.md

@@ -10,11 +10,11 @@ Date: 2025-10-22
 import logging
 import os
 
-from flask import Flask, request
-from flask_cors import CORS
+from flask import Flask, request, Response
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_restx import Api
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,23 @@ def create_app(config_name: str = None):
     app.config['DEBUG'] = config_name == 'development'
     app.config['TESTING'] = config_name == 'testing'
     
+    # Security: Limit request body size to prevent DoS attacks (Issue S1)
+    app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB
+    
+    # Metrics collection (Issue M1)
+    scan_counter = Counter('scans_total', 'Total scans created', ['tool', 'status'])
+    scan_duration = Histogram('scan_duration_seconds', 'Scan execution duration', ['tool'])
+    api_requests = Counter('api_requests_total', 'Total API requests', ['method', 'endpoint', 'status'])
+    api_latency = Histogram('api_request_duration_seconds', 'API request latency', ['method', 'endpoint'])
+    
+    # Store metrics in app context for access by routes
+    app.config['METRICS'] = {
+        'scan_counter': scan_counter,
+        'scan_duration': scan_duration,
+        'api_requests': api_requests,
+        'api_latency': api_latency
+    }
+    
     # Configure rate limiter
     redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
     if config_name == 'production':
@@ -66,8 +83,9 @@ def create_app(config_name: str = None):
     # Initialize rate limiter with app
     limiter.init_app(app)
     
-    # Enable CORS
-    CORS(app, resources={r"/api/*": {"origins": "*"}})
+    # Configure CORS with environment-specific policies
+    from utils.cors_config import init_cors
+    init_cors(app, environment=config_name)
     
     # Create API
     api = Api(
@@ -125,12 +143,33 @@ def create_app(config_name: str = None):
     except Exception as e:
         logger.warning(f"⚠️ Could not start feed scheduler: {e}")
     
-    # Health check endpoint (exempt from rate limiting)
-    @app.route('/health')
-    @limiter.exempt
-    def health():
-        """Health check endpoint (no rate limit)"""
-        return {'status': 'healthy', 'service': 'vulnerability-scanner-api'}, 200
+    # Register health check blueprint
+    from .health import health_bp
+    app.register_blueprint(health_bp)
+    logger.info("✅ Registered health check endpoints (/health, /health/ready, /health/live)")
+    
+    # Metrics endpoint (Issue M1)
+    @app.route('/metrics')
+    def metrics():
+        """Prometheus metrics endpoint"""
+        return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+    
+    # Register global error handlers
+    from utils.error_handlers import register_error_handlers
+    register_error_handlers(app)
+    
+    # Register request ID middleware
+    from utils.request_id import RequestIDMiddleware
+    RequestIDMiddleware(app)
+    
+    # Register security headers middleware
+    from utils.security_headers import init_security_headers
+    init_security_headers(app, environment=config_name)
+    
+    # Register API versioning info endpoints
+    from utils.versioning import api_info_bp
+    app.register_blueprint(api_info_bp)
+    logger.info("✅ Registered API versioning endpoints (/version)")
     
     # Root endpoint
     @app.route('/')
@@ -139,7 +178,9 @@ def create_app(config_name: str = None):
         return {
             'message': 'Vulnerability Scanner API',
             'version': '1.0',
-            'docs': '/api/docs'
+            'api_version': 'v1',
+            'docs': '/api/v1/docs',
+            'health': '/health/ready'
         }, 200
     
     logger.info(f"✅ Flask app created (env={config_name})")
@@ -148,6 +189,10 @@ def create_app(config_name: str = None):
 
 
 if __name__ == '__main__':
-    # For development only
+    # For development only: use env vars and avoid enabling the debugger by default
     app = create_app('development')
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    host = os.getenv('API_HOST', '127.0.0.1')
+    port = int(os.getenv('API_PORT', '5000'))
+    # Don't hardcode debug=True (Bandit flag); derive from app config
+    debug = app.config.get('DEBUG', False)
+    app.run(host=host, port=port, debug=debug)

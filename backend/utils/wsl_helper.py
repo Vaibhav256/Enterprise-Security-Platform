@@ -28,6 +28,7 @@ class WSLCommandResult:
     return_code: int
     command: str
     execution_time: float
+    wsl_command: Optional[str] = None  # Full WSL command for debugging
 
 
 class WSLHelper:
@@ -198,9 +199,13 @@ class WSLHelper:
             "-c",
             sanitized_command,
         ]
+        
+        # Prepare full command string for logging and debugging
+        wsl_command_str = " ".join(wsl_command)
 
         logger.info("Executing WSL command: %s", command)
-        logger.debug("Full command: %s", " ".join(wsl_command))
+        logger.debug("Full WSL command: %s", wsl_command_str)
+        logger.debug("Distribution: %s, Timeout: %ss", self.distribution, timeout)
 
         import time
 
@@ -222,21 +227,37 @@ class WSLHelper:
                 stdout, stderr = process.communicate(timeout=timeout)
                 returncode = process.returncode
             except subprocess.TimeoutExpired:
-                logger.error("Command timed out after %ss, terminating process", timeout)
+                execution_time = time.time() - start_time
+                logger.error("Command timed out after %ss (%.2fs elapsed)", timeout, execution_time)
+                logger.error("  Original command: %s", command)
+                logger.error("  Full WSL command: %s", wsl_command_str)
+                logger.error("  Distribution: %s", self.distribution)
+                
                 # Graceful termination first
                 process.terminate()
                 try:
-                    process.wait(timeout=5)
-                    logger.info("Process terminated gracefully")
+                    stdout, stderr = process.communicate(timeout=5)
+                    logger.info("Process terminated gracefully, captured partial output")
                 except subprocess.TimeoutExpired:
                     # Force kill if still running
                     logger.warning("Process did not terminate, killing forcefully")
                     process.kill()
-                    process.wait()
+                    try:
+                        stdout, stderr = process.communicate(timeout=2)
+                    except:
+                        stdout, stderr = "", ""
                 
-                execution_time = time.time() - start_time
-                logger.error("Command timed out and was terminated after %.2fs", execution_time)
-                raise subprocess.TimeoutExpired(wsl_command, timeout)
+                # Return partial results instead of raising exception
+                logger.warning(f"Command timed out after {execution_time:.2f}s - returning partial output ({len(stdout)} bytes)")
+                return WSLCommandResult(
+                    success=False,
+                    stdout=stdout,
+                    stderr=f"TIMEOUT after {timeout}s: {stderr}",
+                    return_code=-1,  # Indicate timeout
+                    command=command,
+                    execution_time=execution_time,
+                    wsl_command=wsl_command_str,
+                )
 
             execution_time = time.time() - start_time
 
@@ -247,6 +268,7 @@ class WSLHelper:
                 return_code=returncode,
                 command=command,
                 execution_time=execution_time,
+                wsl_command=wsl_command_str,
             )
 
             logger.info(
@@ -274,15 +296,141 @@ class WSLHelper:
 
             return wsl_result
 
-        except subprocess.TimeoutExpired:
-            execution_time = time.time() - start_time
-            logger.error("Command timed out after %ss (execution time: %.2fs)", timeout, execution_time)
-            raise
         except Exception as e:
             logger.error("Command execution failed: %s (command: %s)", str(e), command[:200])
             raise
         finally:
             # Ensure process is cleaned up (QA Issue #2 - prevent zombie processes)
+            if process and process.poll() is None:
+                logger.warning("Cleaning up running process")
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                except Exception as cleanup_error:
+                    logger.error("Failed to cleanup process: %s", cleanup_error)
+
+    def execute_wsl_command_array(
+        self,
+        wsl_command: List[str],
+        timeout: Optional[int] = None,
+        check_success: bool = True,
+    ) -> WSLCommandResult:
+        """
+        Execute a pre-built WSL command array directly (no bash -c wrapping)
+        
+        Use this method when you've already built a complete WSL command using
+        build_wsl_command() from input_validation module. This avoids double
+        WSL nesting that would occur with execute_command().
+        
+        Args:
+            wsl_command: Pre-built WSL command array (e.g., ['wsl.exe', '-d', 'kali-linux', '--', 'nikto', ...])
+            timeout: Timeout in seconds (uses default_timeout if None)
+            check_success: Whether to raise exception on non-zero return code
+            
+        Returns:
+            WSLCommandResult object containing execution details
+            
+        Raises:
+            subprocess.TimeoutExpired: If command times out
+            RuntimeError: If command fails and check_success is True
+        """
+        timeout = timeout or self.default_timeout
+        
+        # Build command string for logging
+        wsl_command_str = " ".join(wsl_command)
+        
+        logger.info("Executing pre-built WSL command array")
+        logger.debug("Full WSL command: %s", wsl_command_str)
+        logger.debug("Timeout: %ss", timeout)
+        
+        import time
+        start_time = time.time()
+        process = None
+        
+        try:
+            # Execute the command array directly
+            process = subprocess.Popen(
+                wsl_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            
+            # Wait with timeout and ensure cleanup
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+                returncode = process.returncode
+            except subprocess.TimeoutExpired:
+                execution_time = time.time() - start_time
+                logger.error("Command timed out after %ss (%.2fs elapsed)", timeout, execution_time)
+                logger.error("  Full WSL command: %s", wsl_command_str)
+                
+                # Graceful termination first
+                process.terminate()
+                try:
+                    stdout, stderr = process.communicate(timeout=5)
+                    logger.info("Process terminated gracefully, captured partial output")
+                except subprocess.TimeoutExpired:
+                    # Force kill if still running
+                    logger.warning("Process did not terminate, killing forcefully")
+                    process.kill()
+                    try:
+                        stdout, stderr = process.communicate(timeout=2)
+                    except:
+                        stdout, stderr = "", ""
+                
+                # Return partial results instead of raising exception
+                logger.warning(f"Command timed out after {execution_time:.2f}s - returning partial output ({len(stdout)} bytes)")
+                return WSLCommandResult(
+                    success=False,
+                    stdout=stdout,
+                    stderr=f"TIMEOUT after {timeout}s: {stderr}",
+                    return_code=-1,  # Indicate timeout
+                    command=" ".join(wsl_command[4:]) if len(wsl_command) > 4 else wsl_command_str,  # Extract actual tool command
+                    execution_time=execution_time,
+                    wsl_command=wsl_command_str,
+                )
+            
+            execution_time = time.time() - start_time
+            
+            wsl_result = WSLCommandResult(
+                success=(returncode == 0),
+                stdout=stdout,
+                stderr=stderr,
+                return_code=returncode,
+                command=" ".join(wsl_command[4:]) if len(wsl_command) > 4 else wsl_command_str,  # Extract actual tool command
+                execution_time=execution_time,
+                wsl_command=wsl_command_str,
+            )
+            
+            logger.info(
+                f"Command completed in {execution_time:.2f}s "
+                f"(return code: {returncode})"
+            )
+            
+            if returncode != 0:
+                error_context = {
+                    'command': wsl_command_str[:200],
+                    'return_code': returncode,
+                    'stderr': stderr[:500],
+                    'execution_time': execution_time,
+                }
+                logger.warning("Command failed: %s", error_context)
+                if check_success:
+                    raise RuntimeError(
+                        f"WSL command failed with return code {returncode}: "
+                        f"{stderr[:500]}\n"
+                        f"Command: {wsl_command_str[:200]}\n"
+                        f"Execution time: {execution_time:.2f}s"
+                    )
+            
+            return wsl_result
+            
+        except Exception as e:
+            logger.error("Command execution failed: %s (command: %s)", str(e), wsl_command_str[:200])
+            raise
+        finally:
+            # Ensure process is cleaned up
             if process and process.poll() is None:
                 logger.warning("Cleaning up running process")
                 try:

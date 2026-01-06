@@ -50,17 +50,29 @@ const CVEDetailPage = () => {
       try {
         console.log(`[CVEDetailPage] Fetching details for ${cveId}...`);
         const response = await feedsApi.getCVE(cveId);
-        console.log('[CVEDetailPage] CVE details received:', response);
+        console.log('[CVEDetailPage] Raw response:', response);
+        console.log('[CVEDetailPage] Response type:', typeof response);
+        console.log('[CVEDetailPage] Response keys:', Object.keys(response));
         
-        // Handle different response formats
+        // Handle API response format: {status: "success", data: {...}}
         const cveData = response.data || response;
-        if (cveData) {
+        console.log('[CVEDetailPage] Extracted CVE data:', cveData);
+        console.log('[CVEDetailPage] CVE data type:', typeof cveData);
+        console.log('[CVEDetailPage] CVE data keys:', cveData ? Object.keys(cveData) : 'null');
+        console.log('[CVEDetailPage] CVE id field:', cveData?.id);
+        console.log('[CVEDetailPage] CVE severity field:', cveData?.severity);
+        console.log('[CVEDetailPage] CVE cvss_score field:', cveData?.cvss_score);
+        
+        if (cveData && (cveData.id || cveData.cve_id || cveData.entry_id)) {
+          console.log('[CVEDetailPage] Setting CVE state with data:', cveData);
           setCve(cveData);
         } else {
-          setError('CVE not found');
+          console.error('[CVEDetailPage] Invalid CVE data - no id found');
+          setError('CVE not found or invalid response');
         }
       } catch (err: any) {
         console.error('[CVEDetailPage] Error fetching CVE:', err);
+        console.error('[CVEDetailPage] Error details:', err.response);
         setError(err.response?.data?.error || err.message || 'Failed to load CVE details');
       } finally {
         setLoading(false);
@@ -284,10 +296,10 @@ const CVEDetailPage = () => {
               {cve.severity.toUpperCase()}
             </div>
           )}
-          {cve.cvss_score !== undefined && (
+          {cve.cvss_score !== undefined && cve.cvss_score !== null && (
             <div className="px-4 py-2 bg-gradient-to-r from-purple-100 to-purple-50 dark:from-purple-900/20 dark:to-purple-800/20 text-purple-900 dark:text-purple-200 rounded-full font-bold border border-purple-300 dark:border-purple-800 shadow-sm flex items-center gap-2">
               <span className="text-lg">CVSS</span>
-              <span className="text-2xl font-mono">{cve.cvss_score.toFixed(1)}</span>
+              <span className="text-2xl font-mono">{Number(cve.cvss_score).toFixed(1)}</span>
               <span className="text-sm">/10</span>
             </div>
           )}
@@ -340,17 +352,17 @@ const CVEDetailPage = () => {
               <div className="space-y-3">
                 {/* CVSS Scores Row */}
                 <div className="grid grid-cols-2 gap-3">
-                  {cve.cvss_v2 !== undefined && (
+                  {cve.cvss_v2 !== undefined && cve.cvss_v2 !== null && (
                     <div className="bg-gradient-to-br from-orange-50 to-orange-100 dark:from-orange-900/20 dark:to-orange-800/20 p-4 rounded-lg border border-orange-200 dark:border-orange-800">
                       <p className="text-xs font-semibold text-orange-700 dark:text-orange-400 uppercase tracking-wider mb-1">CVSS v2.0</p>
-                      <p className="text-3xl font-bold text-orange-900 dark:text-orange-200">{cve.cvss_v2.toFixed(1)}</p>
+                      <p className="text-3xl font-bold text-orange-900 dark:text-orange-200">{Number(cve.cvss_v2).toFixed(1)}</p>
                       <p className="text-xs text-orange-700 dark:text-orange-400 mt-1">Severity Score</p>
                     </div>
                   )}
-                  {cve.cvss_v3 !== undefined && (
+                  {cve.cvss_v3 !== undefined && cve.cvss_v3 !== null && (
                     <div className="bg-gradient-to-br from-gray-50 to-gray-100 dark:from-blue-900/20 dark:to-blue-800/20 p-4 rounded-lg border border-gray-300 dark:border-blue-800">
                       <p className="text-xs font-semibold text-gray-800 dark:text-blue-400 uppercase tracking-wider mb-1">CVSS v3.0</p>
-                      <p className="text-3xl font-bold text-gray-900 dark:text-blue-200">{cve.cvss_v3.toFixed(1)}</p>
+                      <p className="text-3xl font-bold text-gray-900 dark:text-blue-200">{Number(cve.cvss_v3).toFixed(1)}</p>
                       <p className="text-xs text-gray-800 dark:text-blue-400 mt-1">Severity Score</p>
                     </div>
                   )}
@@ -460,12 +472,19 @@ const CVEDetailPage = () => {
                 <h3 className="text-2xl font-bold text-gray-900 dark:text-white">Affected Products</h3>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                {cve.affected_products.map((product, idx) => (
-                  <div key={idx} className="flex items-start gap-3 p-3 bg-red-50 dark:bg-red-900/20 rounded-lg border border-red-200 dark:border-red-800">
-                    <span className="text-red-600 dark:text-red-400 font-bold mt-0.5">◆</span>
-                    <span className="text-gray-700 dark:text-gray-300 text-sm">{product}</span>
-                  </div>
-                ))}
+                {cve.affected_products.map((product, idx) => {
+                  // Handle both string format and object format {vendor, product, version}
+                  const displayText = typeof product === 'string' 
+                    ? product 
+                    : `${product.vendor || ''} ${product.product || ''} ${product.version || ''}`.trim();
+                  
+                  return (
+                    <div key={idx} className="flex items-start gap-3 p-3 bg-red-50 dark:bg-red-900/20 rounded-lg border border-red-200 dark:border-red-800">
+                      <span className="text-red-600 dark:text-red-400 font-bold mt-0.5">◆</span>
+                      <span className="text-gray-700 dark:text-gray-300 text-sm">{displayText}</span>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}

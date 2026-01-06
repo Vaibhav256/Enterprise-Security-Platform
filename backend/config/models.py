@@ -43,7 +43,7 @@ class FeedEntry(Base):
     description = Column(Text)
     
     # Severity and scoring
-    severity = Column(String(20))  # 'critical', 'high', 'medium', 'low', 'info'
+    severity = Column(String(20), index=True)  # 'critical', 'high', 'medium', 'low', 'info' - indexed for filtering
     cvss_score = Column(DECIMAL(3, 1))
     cvss_vector = Column(String(200))
     
@@ -139,7 +139,7 @@ class Vulnerability(Base):
     __tablename__ = 'vulnerabilities'
     
     vuln_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    scan_id = Column(String(36), ForeignKey('scans.id', ondelete='CASCADE'))
+    scan_id = Column(String(36), ForeignKey('scans.id', ondelete='CASCADE'), index=True)  # Explicit index for FK queries
     severity = Column(String(20), nullable=False)
     title = Column(String(255), nullable=False)
     description = Column(Text)

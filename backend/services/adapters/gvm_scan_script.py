@@ -125,13 +125,15 @@ def create_and_run_scan(target, scan_type, socket_path, username, password, opti
             gmp.start_task(task_id)
             print("Scan started!", file=sys.stderr)
             
-            # Wait for completion (poll every 30 seconds)
+            # Wait for completion - poll status periodically
+            # OpenVAS scans can take 30+ minutes for thorough vulnerability checks
+            GVM_POLL_INTERVAL_SECONDS = 30  # Check scan status every 30 seconds
             max_wait = 7200  # 2 hour timeout (OpenVAS scans can be slow)
             wait_time = 0
             
             while wait_time < max_wait:
-                time.sleep(30)
-                wait_time += 30
+                time.sleep(GVM_POLL_INTERVAL_SECONDS)
+                wait_time += GVM_POLL_INTERVAL_SECONDS
                 
                 # Get task status
                 task_status = gmp.get_task(task_id)
@@ -200,6 +202,7 @@ if __name__ == "__main__":
     
     # Parse optional JSON options argument
     options = {}
+    output_file = None  # Optional output file path
     if len(sys.argv) > 6:
         try:
             options = json.loads(sys.argv[6])
@@ -208,9 +211,21 @@ if __name__ == "__main__":
             print(f"Warning: Failed to parse options JSON: {e}", file=sys.stderr)
             options = {}
     
+    # Check for output file argument
+    if len(sys.argv) > 7:
+        output_file = sys.argv[7]
+    
     try:
         report = create_and_run_scan(target, scan_type, socket_path, username, password, options)
-        print(report)  # Output the XML report to stdout
+        
+        # Write to file if specified, otherwise stdout
+        if output_file:
+            with open(output_file, 'w') as f:
+                f.write(report)
+            print(f"Report written to {output_file}", file=sys.stderr)
+        else:
+            print(report)  # Output the XML report to stdout (legacy mode)
+        
         sys.exit(0)
     except Exception as e:
         print(f"Fatal error: {e}", file=sys.stderr)

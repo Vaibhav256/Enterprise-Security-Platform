@@ -10,7 +10,7 @@ Date: 2025-10-22
 
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from utils.parsers import NmapParser
 from utils.target_parser import UniversalTargetParser
@@ -64,8 +64,11 @@ class NmapAdapter(BaseAdapter):
         }
 
     def get_default_timeout(self) -> int:
-        """Nmap scans can take longer"""
-        return 600  # 10 minutes
+        """
+        Dynamic timeout based on scan complexity
+        Scans run until natural completion (safety limit: 6 hours)
+        """
+        return 21600  # 6 hours - allows comprehensive scans to complete naturally
 
     def validate_target(self, target: str) -> bool:
         """
@@ -95,7 +98,7 @@ class NmapAdapter(BaseAdapter):
 
     def build_command(
         self, target: str, scan_type: str, options: Dict[str, Any]
-    ) -> str:
+    ) -> List[str]:
         """
         Build Nmap command using safe array-based construction
 
@@ -105,7 +108,7 @@ class NmapAdapter(BaseAdapter):
             options: Additional options
 
         Returns:
-            Nmap command string
+            WSL command array (e.g., ['wsl.exe', '-d', 'kali-linux', '--', 'nmap', ...])
             
         Raises:
             ValueError: If target is invalid
@@ -209,7 +212,11 @@ class NmapAdapter(BaseAdapter):
 
         # Add XML output to temp file (safely constructed filename)
         safe_target = nmap_target.replace('/', '_').replace('\\', '_').replace(':', '_')
-        output_file = f"/tmp/nmap_scan_{safe_target}.xml"
+        # Use a secure temporary file instead of hardcoding /tmp
+        import tempfile
+        tmpf = tempfile.NamedTemporaryFile(prefix=f"nmap_scan_{safe_target}_", suffix='.xml', delete=False)
+        output_file = tmpf.name
+        tmpf.close()
         cmd_parts.extend(["-oX", output_file])
 
         # Add target (now in Nmap-compatible format)
@@ -223,16 +230,10 @@ class NmapAdapter(BaseAdapter):
                 tool="nmap",
                 tool_args=cmd_parts[1:]  # Skip 'nmap' as it's added by build_wsl_command
             )
-            # Append command to read output file
-            read_wsl_cmd = WSLCommandValidator.build_wsl_command(
-                distro="kali-linux",
-                tool="cat",
-                tool_args=[output_file]
-            )
-            # Convert arrays to shell command strings (safe because arrays are pre-validated)
-            import shlex
-            full_cmd = ' '.join(shlex.quote(arg) for arg in wsl_cmd) + ' && ' + ' '.join(shlex.quote(arg) for arg in read_wsl_cmd)
-            return full_cmd
+            logger.info("Built Nmap WSL command array (validated)")
+            # Return array with output file path for later reading
+            self._nmap_output_file = output_file
+            return wsl_cmd
         except ValueError as e:
             self.logger.error("Command validation failed: %s", str(e))
             raise

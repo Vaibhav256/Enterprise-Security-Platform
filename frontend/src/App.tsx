@@ -21,9 +21,9 @@ const NotFoundPage = lazy(() => import('./pages/NotFoundPage'));
 
 function App() {
   return (
-    <ErrorBoundary>
-      <ToastProvider>
-        <Router>
+    <ToastProvider>
+      <Router>
+        <ErrorBoundary>
           <Layout>
             <div className="p-6">
               <Suspense fallback={<LoadingSpinner size="lg" fullScreen text="Loading page..." />}>
@@ -42,9 +42,9 @@ function App() {
               </Suspense>
             </div>
           </Layout>
-        </Router>
-      </ToastProvider>
-    </ErrorBoundary>
+        </ErrorBoundary>
+      </Router>
+    </ToastProvider>
   );
 }
 

@@ -13,6 +13,7 @@ export interface Scan {
   status: ScanStatus;
   priority?: string;
   progress?: number;
+  progress_message?: string;
   created_at: string;
   started_at?: string;
   completed_at?: string;

@@ -20,6 +20,7 @@ Date: 2025-10-30
 import logging
 from typing import Dict
 from functools import wraps
+import threading
 
 from flask import Blueprint, jsonify, make_response, request
 from flask_restx import Api, Namespace, Resource, fields
@@ -29,30 +30,43 @@ from utils.jwt_handler import get_jwt_handler, jwt_required, get_current_user
 
 logger = logging.getLogger(__name__)
 
-# Rate limiter will be set from app factory
+# Thread-safe rate limiter storage
 _limiter = None
+_limiter_lock = threading.Lock()
 
 def set_limiter(limiter_instance):
-    """Set the rate limiter instance from app factory"""
+    """Set the rate limiter instance from app factory (thread-safe)"""
     global _limiter
-    _limiter = limiter_instance
+    with _limiter_lock:
+        _limiter = limiter_instance
+        logger.info("Rate limiter configured for auth routes")
 
 def rate_limit(limit_string):
     """
-    Decorator to apply rate limiting to Flask-RESTX Resource methods.
+    Decorator to apply rate limiting to Flask-RESTX Resource methods (thread-safe).
     
     Args:
         limit_string: Rate limit string (e.g., "5 per minute")
+    
+    Thread Safety: Uses lock to safely access _limiter instance
     """
     def decorator(func):
         @wraps(func)
         def wrapped(*args, **kwargs):
-            if _limiter is not None:
+            with _limiter_lock:
+                limiter = _limiter
+            
+            if limiter is not None:
                 # Apply rate limit using the limiter instance
-                limited_func = _limiter.limit(limit_string)(func)
+                limited_func = limiter.limit(limit_string)(func)
                 return limited_func(*args, **kwargs)
-            # If limiter not available, proceed without rate limiting
-            return func(*args, **kwargs)
+            else:
+                # If limiter not available, log warning and proceed
+                logger.warning(
+                    "Rate limiter not configured - %s proceeding without rate limiting",
+                    func.__name__
+                )
+                return func(*args, **kwargs)
         return wrapped
     return decorator
 
@@ -119,6 +133,18 @@ class Login(Resource):
         
         # TODO: Replace with actual database authentication
         # For now, accept any non-empty credentials for testing
+        # 
+        # ⚠️  SECURITY WARNING (Issue Q2): Mock Authentication Active
+        # This is INTENTIONAL for development/testing environment.
+        # Production deployment MUST implement proper user database:
+        #   1. Create User model with password hashing (bcrypt/argon2)
+        #   2. Implement user registration endpoint
+        #   3. Add role-based access control (RBAC)
+        #   4. Enable database authentication below
+        #   5. Remove mock user creation
+        # 
+        # Current behavior: Accepts ANY non-empty username/password
+        # DO NOT DEPLOY TO PRODUCTION without proper authentication!
         if not username or not password:
             logger.warning(f"Failed login attempt: empty credentials")
             return {'error': 'Invalid credentials'}, 401

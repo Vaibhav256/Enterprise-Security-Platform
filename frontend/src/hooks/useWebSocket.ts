@@ -72,6 +72,16 @@ export const useWebSocket = (options: UseWebSocketOptions = {}) => {
       onMessageRef.current?.(message);
     });
 
+    socket.on('scan_progress', (data: any) => {
+      const message: WSMessage = {
+        type: 'scan_update',
+        scan_id: data.scan_id,
+        data,
+      };
+      setLastMessage(message);
+      onMessageRef.current?.(message);
+    });
+
     socket.on('scan_complete', (data: any) => {
       const message: WSMessage = {
         type: 'scan_complete',

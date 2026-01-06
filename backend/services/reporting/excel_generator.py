@@ -64,17 +64,19 @@ class ExcelReportGenerator:
         # Create workbook
         self.workbook = xlsxwriter.Workbook(self.filepath)
         
-        # Setup custom formats
-        self._setup_formats()
-        
-        # Build worksheets
-        self._build_summary_sheet(scan_data, organization, classification)
-        self._build_vulnerabilities_sheet(scan_data)
-        self._build_mitigations_sheet(scan_data)
-        self._build_charts_sheet(scan_data)
-        
-        # Close workbook
-        self.workbook.close()
+        try:
+            # Setup custom formats
+            self._setup_formats()
+            
+            # Build worksheets
+            self._build_summary_sheet(scan_data, organization, classification)
+            self._build_vulnerabilities_sheet(scan_data)
+            self._build_mitigations_sheet(scan_data)
+            self._build_charts_sheet(scan_data)
+        finally:
+            # Always close workbook to prevent memory leaks
+            if self.workbook:
+                self.workbook.close()
         
         return self.filepath
     
@@ -466,7 +468,8 @@ class ExcelReportGenerator:
                     try:
                         import json
                         metadata = json.loads(metadata)
-                    except:
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.debug(f"Failed to parse metadata JSON: {e}")
                         metadata = {}
                 
                 # Look for OID in metadata

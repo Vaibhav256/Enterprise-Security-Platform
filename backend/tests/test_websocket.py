@@ -73,10 +73,11 @@ class TestConnectionHandlers:
     def test_handle_disconnect_single_room(self, app):
         """Test client disconnection from single room"""
         from api_gateway.websocket import handle_disconnect
+        from datetime import datetime
         
         # Setup: client in one scan room
         scan_rooms.clear()
-        scan_rooms['scan-123'] = {'client-abc'}
+        scan_rooms['scan-123'] = {'clients': {'client-abc'}, 'last_activity': datetime.now()}
         
         with app.test_request_context():
             with patch('api_gateway.websocket.request') as mock_request:
@@ -90,11 +91,12 @@ class TestConnectionHandlers:
     def test_handle_disconnect_multiple_rooms(self, app):
         """Test client disconnection from multiple rooms"""
         from api_gateway.websocket import handle_disconnect
+        from datetime import datetime
         
         # Setup: client in multiple scan rooms
         scan_rooms.clear()
-        scan_rooms['scan-1'] = {'client-abc', 'client-xyz'}
-        scan_rooms['scan-2'] = {'client-abc'}
+        scan_rooms['scan-1'] = {'clients': {'client-abc', 'client-xyz'}, 'last_activity': datetime.now()}
+        scan_rooms['scan-2'] = {'clients': {'client-abc'}, 'last_activity': datetime.now()}
         
         with app.test_request_context():
             with patch('api_gateway.websocket.request') as mock_request:
@@ -103,9 +105,9 @@ class TestConnectionHandlers:
                 handle_disconnect()
                 
                 # Should remove client from both rooms
-                assert 'client-abc' not in scan_rooms.get('scan-1', set())
+                assert 'client-abc' not in scan_rooms.get('scan-1', {}).get('clients', set())
                 assert 'scan-2' not in scan_rooms  # Empty room cleaned up
-                assert scan_rooms['scan-1'] == {'client-xyz'}  # Other client remains
+                assert scan_rooms['scan-1']['clients'] == {'client-xyz'}  # Other client remains
 
     def test_handle_disconnect_no_rooms(self, app):
         """Test client disconnection when not in any rooms"""
@@ -145,9 +147,11 @@ class TestRoomSubscriptions:
                 # Should join room
                 mock_join.assert_called_once_with('scan-abc')
                 
-                # Should track subscription
+                # Should track subscription with new structure
                 assert 'scan-abc' in scan_rooms
-                assert 'client-123' in scan_rooms['scan-abc']
+                assert 'clients' in scan_rooms['scan-abc']
+                assert 'last_activity' in scan_rooms['scan-abc']
+                assert 'client-123' in scan_rooms['scan-abc']['clients']
                 
                 # Should emit confirmation
                 mock_emit.assert_called_once()
@@ -175,10 +179,11 @@ class TestRoomSubscriptions:
                 mock_request.sid = 'client-2'
                 handle_subscribe_scan({'scan_id': 'scan-abc'})
                 
-                # Should have 2 subscribers
-                assert len(scan_rooms['scan-abc']) == 2
-                assert 'client-1' in scan_rooms['scan-abc']
-                assert 'client-2' in scan_rooms['scan-abc']
+                # Should have 2 subscribers in new structure
+                assert 'clients' in scan_rooms['scan-abc']
+                assert len(scan_rooms['scan-abc']['clients']) == 2
+                assert 'client-1' in scan_rooms['scan-abc']['clients']
+                assert 'client-2' in scan_rooms['scan-abc']['clients']
                 
                 # Last emit should show room_size=2
                 last_call = mock_emit.call_args[0]
@@ -215,7 +220,7 @@ class TestRoomSubscriptions:
         
         # Setup: client already subscribed
         scan_rooms.clear()
-        scan_rooms['scan-abc'] = {'client-123'}
+        scan_rooms['scan-abc'] = {'clients': {'client-123'}, 'last_activity': datetime.now()}
         
         with app.test_request_context():
             with patch('api_gateway.websocket.request') as mock_request, \
@@ -242,10 +247,11 @@ class TestRoomSubscriptions:
     def test_unsubscribe_scan_keep_room_with_other_clients(self, app):
         """Test unsubscription keeps room with remaining clients"""
         from api_gateway.websocket import handle_unsubscribe_scan
+        from datetime import datetime
         
         # Setup: multiple clients in room
         scan_rooms.clear()
-        scan_rooms['scan-abc'] = {'client-1', 'client-2'}
+        scan_rooms['scan-abc'] = {'clients': {'client-1', 'client-2'}, 'last_activity': datetime.now()}
         
         with app.test_request_context():
             with patch('api_gateway.websocket.request') as mock_request, \
@@ -258,7 +264,7 @@ class TestRoomSubscriptions:
                 
                 # Should keep room with remaining client
                 assert 'scan-abc' in scan_rooms
-                assert scan_rooms['scan-abc'] == {'client-2'}
+                assert scan_rooms['scan-abc']['clients'] == {'client-2'}
 
     def test_unsubscribe_scan_missing_scan_id(self, app):
         """Test unsubscription without scan_id"""
@@ -268,7 +274,8 @@ class TestRoomSubscriptions:
         
         with app.test_request_context():
             with patch('api_gateway.websocket.request') as mock_request, \
-                 patch('api_gateway.websocket.leave_room') as mock_leave:
+                 patch('api_gateway.websocket.leave_room') as mock_leave, \
+                 patch('api_gateway.websocket.emit'):  # Mock emit to avoid namespace error
                 
                 mock_request.sid = 'client-123'
                 data = {}  # Missing scan_id
@@ -281,9 +288,10 @@ class TestRoomSubscriptions:
     def test_unsubscribe_scan_not_in_room(self, app):
         """Test unsubscription when client not in room"""
         from api_gateway.websocket import handle_unsubscribe_scan
+        from datetime import datetime
         
         scan_rooms.clear()
-        scan_rooms['scan-abc'] = {'client-other'}
+        scan_rooms['scan-abc'] = {'clients': {'client-other'}, 'last_activity': datetime.now()}
         
         with app.test_request_context():
             with patch('api_gateway.websocket.request') as mock_request, \
@@ -296,7 +304,7 @@ class TestRoomSubscriptions:
                 handle_unsubscribe_scan({'scan_id': 'scan-abc'})
                 
                 # Room should be unchanged
-                assert scan_rooms['scan-abc'] == {'client-other'}
+                assert scan_rooms['scan-abc']['clients'] == {'client-other'}
 
 
 class TestPingHandler:
@@ -321,8 +329,9 @@ class TestEventEmission:
 
     def test_emit_scan_event_success(self):
         """Test successful event emission to room"""
+        from datetime import datetime
         scan_rooms.clear()
-        scan_rooms['scan-123'] = {'client-1', 'client-2'}
+        scan_rooms['scan-123'] = {'clients': {'client-1', 'client-2'}, 'last_activity': datetime.now()}
         
         with patch('api_gateway.websocket.socketio') as mock_socketio:
             emit_scan_event('scan-123', 'test_event', {'data': 'value'})
@@ -472,26 +481,28 @@ class TestRoomStats:
 
     def test_get_room_stats_multiple_rooms(self):
         """Test stats with multiple active rooms"""
+        from datetime import datetime
         scan_rooms.clear()
-        scan_rooms['scan-1'] = {'client-a', 'client-b'}
-        scan_rooms['scan-2'] = {'client-c'}
-        scan_rooms['scan-3'] = {'client-d', 'client-e', 'client-f'}
+        scan_rooms['scan-1'] = {'clients': {'client-a', 'client-b'}, 'last_activity': datetime.now()}
+        scan_rooms['scan-2'] = {'clients': {'client-c'}, 'last_activity': datetime.now()}
+        scan_rooms['scan-3'] = {'clients': {'client-d', 'client-e', 'client-f'}, 'last_activity': datetime.now()}
         
         stats = get_room_stats()
         
         assert stats['total_rooms'] == 3
         assert stats['total_subscribers'] == 6
-        assert stats['rooms']['scan-1'] == 2
-        assert stats['rooms']['scan-2'] == 1
-        assert stats['rooms']['scan-3'] == 3
+        assert stats['rooms']['scan-1']['subscriber_count'] == 2
+        assert stats['rooms']['scan-2']['subscriber_count'] == 1
+        assert stats['rooms']['scan-3']['subscriber_count'] == 3
 
     def test_get_room_stats_single_room(self):
         """Test stats with single room"""
+        from datetime import datetime
         scan_rooms.clear()
-        scan_rooms['scan-only'] = {'client-1'}
+        scan_rooms['scan-only'] = {'clients': {'client-1'}, 'last_activity': datetime.now()}
         
         stats = get_room_stats()
         
         assert stats['total_rooms'] == 1
         assert stats['total_subscribers'] == 1
-        assert stats['rooms']['scan-only'] == 1
+        assert stats['rooms']['scan-only']['subscriber_count'] == 1

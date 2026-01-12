@@ -18,7 +18,7 @@ numpy==1.26.3                     # Numerical operations
 pandas==2.2.0                     # Data manipulation
 
 # Visualization (for attack graph rendering)
-matplotlib==3.8.2                 # Static graph visualization
+matplotlib==3.10.8                 # Static graph visualization
 plotly==5.18.0                    # Interactive graph visualization
 
 # Performance Monitoring

@@ -22,7 +22,7 @@ matplotlib==3.8.2                 # Static graph visualization
 plotly==5.18.0                    # Interactive graph visualization
 
 # Performance Monitoring
-tqdm==4.66.1                      # Progress bars for indexing
+tqdm==4.67.1                      # Progress bars for indexing
 
 # Optional: Advanced Retrieval
 # cross-encoder/ms-marco-MiniLM-L-6-v2  # For reranking (loaded via sentence-transformers)
